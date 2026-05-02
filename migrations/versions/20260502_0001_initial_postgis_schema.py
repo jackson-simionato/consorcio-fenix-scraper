@@ -81,16 +81,38 @@ def upgrade() -> None:
     )
     op.create_index(op.f("ix_route_directions_route_version_id"), "route_directions", ["route_version_id"], unique=False)
     op.create_table(
+        "service_directions",
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("route_version_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("route_direction_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("sequence", sa.Integer(), nullable=False),
+        sa.Column("departure_label", sa.Text(), nullable=False),
+        sa.Column("normalized_name", sa.Text(), nullable=True),
+        sa.Column("direction_kind", sa.Text(), nullable=True),
+        sa.Column("confidence", sa.String(length=16), nullable=False),
+        sa.Column("method", sa.String(length=32), nullable=False),
+        sa.Column("notes", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.ForeignKeyConstraint(["route_direction_id"], ["route_directions.id"]),
+        sa.ForeignKeyConstraint(["route_version_id"], ["route_versions.id"]),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("route_version_id", "departure_label", name="uq_service_directions_route_version_departure_label"),
+    )
+    op.create_index(op.f("ix_service_directions_route_direction_id"), "service_directions", ["route_direction_id"], unique=False)
+    op.create_index(op.f("ix_service_directions_route_version_id"), "service_directions", ["route_version_id"], unique=False)
+    op.create_table(
         "schedule_entries",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("route_version_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("service_direction_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("day_type", sa.Text(), nullable=False),
         sa.Column("departure_label", sa.Text(), nullable=False),
         sa.Column("time", sa.String(length=5), nullable=False),
         sa.Column("flags", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+        sa.ForeignKeyConstraint(["service_direction_id"], ["service_directions.id"]),
         sa.ForeignKeyConstraint(["route_version_id"], ["route_versions.id"]),
         sa.PrimaryKeyConstraint("id"),
     )
+    op.create_index(op.f("ix_schedule_entries_service_direction_id"), "schedule_entries", ["service_direction_id"], unique=False)
     op.create_index(op.f("ix_schedule_entries_route_version_id"), "schedule_entries", ["route_version_id"], unique=False)
     op.create_table(
         "itinerary_steps",
@@ -133,8 +155,12 @@ def downgrade() -> None:
     op.drop_table("stops")
     op.drop_index(op.f("ix_itinerary_steps_route_version_id"), table_name="itinerary_steps")
     op.drop_table("itinerary_steps")
+    op.drop_index(op.f("ix_schedule_entries_service_direction_id"), table_name="schedule_entries")
     op.drop_index(op.f("ix_schedule_entries_route_version_id"), table_name="schedule_entries")
     op.drop_table("schedule_entries")
+    op.drop_index(op.f("ix_service_directions_route_version_id"), table_name="service_directions")
+    op.drop_index(op.f("ix_service_directions_route_direction_id"), table_name="service_directions")
+    op.drop_table("service_directions")
     op.drop_index(op.f("ix_route_directions_route_version_id"), table_name="route_directions")
     op.drop_table("route_directions")
     op.drop_index(op.f("ix_route_versions_source_hash"), table_name="route_versions")

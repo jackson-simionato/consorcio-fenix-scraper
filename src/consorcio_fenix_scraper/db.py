@@ -10,7 +10,14 @@ from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, Strin
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
-from consorcio_fenix_scraper.domain import RouteDirection, RouteSnapshot, ScrapeRunResult, ScrapeStatus
+from consorcio_fenix_scraper.domain import (
+    DirectionMatchConfidence,
+    DirectionMatchMethod,
+    RouteDirection,
+    RouteSnapshot,
+    ScrapeRunResult,
+    ScrapeStatus,
+)
 from consorcio_fenix_scraper.logging import get_logger
 
 
@@ -26,6 +33,10 @@ JSON_TYPE = JSON().with_variant(JSONB, "postgresql")
 
 def _uuid_pk():
     return mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+
+
+def _geometry_type(geometry_type: str):
+    return Text().with_variant(Geometry(geometry_type, srid=4326), "postgresql")
 
 
 class ScrapeRunRecord(Base):
@@ -87,7 +98,27 @@ class RouteDirectionRecord(Base):
     route_version_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("route_versions.id"), index=True)
     name: Mapped[str] = mapped_column(Text)
     sequence: Mapped[int] = mapped_column(Integer)
-    geometry: Mapped[object] = mapped_column(Geometry("LINESTRING", srid=4326))
+    geometry: Mapped[object] = mapped_column(_geometry_type("LINESTRING"))
+
+
+class ServiceDirectionRecord(Base):
+    __tablename__ = "service_directions"
+    __table_args__ = (UniqueConstraint("route_version_id", "departure_label", name="uq_service_directions_route_version_departure_label"),)
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    route_version_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("route_versions.id"), index=True)
+    route_direction_id: Mapped[PyUUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("route_directions.id"),
+        index=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer)
+    departure_label: Mapped[str] = mapped_column(Text)
+    normalized_name: Mapped[str | None] = mapped_column(Text)
+    direction_kind: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[str] = mapped_column(String(16), default=DirectionMatchConfidence.NONE.value)
+    method: Mapped[str] = mapped_column(String(32), default=DirectionMatchMethod.UNMATCHED.value)
+    notes: Mapped[dict] = mapped_column(JSON_TYPE, default=dict)
 
 
 class ScheduleEntryRecord(Base):
@@ -95,6 +126,11 @@ class ScheduleEntryRecord(Base):
 
     id: Mapped[PyUUID] = _uuid_pk()
     route_version_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("route_versions.id"), index=True)
+    service_direction_id: Mapped[PyUUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("service_directions.id"),
+        index=True,
+    )
     day_type: Mapped[str] = mapped_column(Text)
     departure_label: Mapped[str] = mapped_column(Text)
     time: Mapped[str] = mapped_column(String(5))
@@ -117,7 +153,7 @@ class StopRecord(Base):
     external_id: Mapped[str | None] = mapped_column(Text, index=True)
     name: Mapped[str | None] = mapped_column(Text)
     source: Mapped[str] = mapped_column(Text)
-    geometry: Mapped[object | None] = mapped_column(Geometry("POINT", srid=4326))
+    geometry: Mapped[object | None] = mapped_column(_geometry_type("POINT"))
 
 
 class RawPageRecord(Base):
@@ -221,25 +257,57 @@ def _persist_snapshot(session: Session, run_id: PyUUID, snapshot: RouteSnapshot)
 
 
 def _persist_children(session: Session, route_version_id: PyUUID, snapshot: RouteSnapshot) -> None:
+    route_directions: list[RouteDirectionRecord] = []
     for index, direction in enumerate(snapshot.directions, start=1):
-        session.add(
-            RouteDirectionRecord(
-                route_version_id=route_version_id,
-                name=direction.name,
-                sequence=index,
-                geometry=_linestring_wkt(direction),
-            )
+        route_direction = RouteDirectionRecord(
+            route_version_id=route_version_id,
+            name=direction.name,
+            sequence=index,
+            geometry=_linestring_wkt(direction),
         )
-    for entry in snapshot.route.schedules:
-        session.add(
-            ScheduleEntryRecord(
-                route_version_id=route_version_id,
-                day_type=entry.day_type,
-                departure_label=entry.departure_label,
-                time=entry.time,
-                flags=list(entry.flags),
-            )
+        session.add(route_direction)
+        route_directions.append(route_direction)
+    session.flush()
+
+    route_direction_by_sequence = {direction.sequence: direction.id for direction in route_directions}
+    matches_by_service_sequence = {match.service_direction_sequence: match for match in snapshot.direction_matches}
+    service_directions: list[ServiceDirectionRecord] = []
+    for service_direction in sorted(snapshot.route.service_directions, key=lambda service: service.sequence):
+        match = matches_by_service_sequence.get(service_direction.sequence)
+        route_direction_id = (
+            route_direction_by_sequence.get(match.route_direction_sequence)
+            if match is not None and match.route_direction_sequence is not None
+            else None
         )
+        service_record = ServiceDirectionRecord(
+            route_version_id=route_version_id,
+            route_direction_id=route_direction_id,
+            sequence=service_direction.sequence,
+            departure_label=service_direction.departure_label,
+            normalized_name=service_direction.normalized_name,
+            direction_kind=service_direction.direction_kind,
+            confidence=(match.confidence.value if match is not None else DirectionMatchConfidence.NONE.value),
+            method=(match.method.value if match is not None else DirectionMatchMethod.UNMATCHED.value),
+            notes=dict(match.notes) if match is not None else {},
+        )
+        session.add(service_record)
+        service_directions.append(service_record)
+    session.flush()
+
+    service_direction_by_sequence = {direction.sequence: direction.id for direction in service_directions}
+    for service_direction in snapshot.route.service_directions:
+        service_direction_id = service_direction_by_sequence[service_direction.sequence]
+        for entry in service_direction.schedules:
+            session.add(
+                ScheduleEntryRecord(
+                    route_version_id=route_version_id,
+                    service_direction_id=service_direction_id,
+                    day_type=entry.day_type,
+                    departure_label=entry.departure_label,
+                    time=entry.time,
+                    flags=list(entry.flags),
+                )
+            )
     for step in snapshot.route.itinerary_steps:
         session.add(ItineraryStepRecord(route_version_id=route_version_id, sequence=step.sequence, name=step.name))
 
