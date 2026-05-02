@@ -34,7 +34,7 @@ def test_dry_run_cli_emits_lifecycle_logs_without_changing_summary(monkeypatch, 
     fixture_dir = Path(__file__).parent / "fixtures"
     monkeypatch.delenv("LOG_LEVEL", raising=False)
 
-    with caplog.at_level(logging.INFO, logger="consorcio_fenix_scraper"):
+    with caplog.at_level(logging.DEBUG, logger="consorcio_fenix_scraper"):
         result = runner.invoke(
             app,
             [
@@ -51,4 +51,8 @@ def test_dry_run_cli_emits_lifecycle_logs_without_changing_summary(monkeypatch, 
     assert result.stdout.strip() == "routes=1 schedules=5 geometries=2 itinerary_steps=3 stops=0 warnings=1 failures=0"
     assert "Starting route scrape" in caplog.text
     assert "Running in dry-run mode; database writes disabled" in caplog.text
+    assert (
+        "Parsed fixture route code=110 schedules=5 service_directions=0 directions=2 direction_matches=0"
+        in caplog.text
+    )
     assert "Completed route scrape: routes=1 schedules=5 geometries=2 itinerary_steps=3 stops=0 warnings=1 failures=0" in caplog.text

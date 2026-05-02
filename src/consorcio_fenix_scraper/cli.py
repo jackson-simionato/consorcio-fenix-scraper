@@ -8,6 +8,7 @@ import typer
 from consorcio_fenix_scraper.config import load_config
 from consorcio_fenix_scraper.db import hash_text, make_session_factory, persist_snapshots
 from consorcio_fenix_scraper.domain import RouteSnapshot, ScrapeRunResult
+from consorcio_fenix_scraper.directions import infer_service_direction_matches
 from consorcio_fenix_scraper.http import HttpFetcher, limited, parse_route_links
 from consorcio_fenix_scraper.logging import configure_logging, get_logger
 from consorcio_fenix_scraper.parsers.kml import extract_kml, parse_kml_directions
@@ -85,17 +86,28 @@ def _load_fixture_snapshots(route_html: Path | None, map_html: Path | None) -> l
     if map_html:
         logger.info("Loading map fixture: %s", map_html)
     directions = parse_kml_directions(extract_kml(map_text)) if map_text else []
+    direction_matches = infer_service_direction_matches(route.service_directions, directions)
     source_hash = hash_text(route_text)
     map_hash = hash_text(map_text) if map_text else None
-    logger.debug(
-        "Parsed fixture route code=%s schedules=%s directions=%s source_hash=%s map_hash=%s",
+    logger.info(
+        "Parsed fixture route code=%s schedules=%s service_directions=%s directions=%s direction_matches=%s source_hash=%s map_hash=%s",
         route.code,
         len(route.schedules),
+        len(route.service_directions),
         len(directions),
+        len(direction_matches),
         source_hash,
         map_hash,
     )
-    return [RouteSnapshot(route=route, directions=directions, source_hash=source_hash, map_hash=map_hash)]
+    return [
+        RouteSnapshot(
+            route=route,
+            directions=directions,
+            direction_matches=direction_matches,
+            source_hash=source_hash,
+            map_hash=map_hash,
+        )
+    ]
 
 
 def _fetch_live_snapshots(source_url: str, limit: int | None) -> list[RouteSnapshot]:
@@ -112,11 +124,14 @@ def _fetch_live_snapshots(source_url: str, limit: int | None) -> list[RouteSnaps
             route = parse_route_page(route_html, page_url=route_url)
             map_text = fetcher.get_text(route.map_url) if route.map_url else ""
             directions = parse_kml_directions(extract_kml(map_text)) if map_text else []
+            direction_matches = infer_service_direction_matches(route.service_directions, directions)
             logger.info(
-                "Parsed route %s: schedules=%s directions=%s itinerary_steps=%s",
+                "Parsed route %s: schedules=%s service_directions=%s directions=%s direction_matches=%s itinerary_steps=%s",
                 route.code,
                 len(route.schedules),
+                len(route.service_directions),
                 len(directions),
+                len(direction_matches),
                 len(route.itinerary_steps),
             )
             logger.debug(
@@ -129,6 +144,7 @@ def _fetch_live_snapshots(source_url: str, limit: int | None) -> list[RouteSnaps
                 RouteSnapshot(
                     route=route,
                     directions=directions,
+                    direction_matches=direction_matches,
                     source_hash=hash_text(route_html),
                     map_hash=hash_text(map_text) if map_text else None,
                 )
