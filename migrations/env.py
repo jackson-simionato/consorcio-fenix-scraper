@@ -5,9 +5,11 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from consorcio_fenix_scraper.config import load_config
 from consorcio_fenix_scraper.db import Base
 
 config = context.config
+config.set_main_option("sqlalchemy.url", load_config().database_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

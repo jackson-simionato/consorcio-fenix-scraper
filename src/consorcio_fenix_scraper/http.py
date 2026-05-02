@@ -9,19 +9,20 @@ from urllib.parse import urljoin
 import httpx
 from bs4 import BeautifulSoup
 
+from consorcio_fenix_scraper.config import load_config
 from consorcio_fenix_scraper.logging import get_logger
 
 
-BASE_URL = "https://www.consorciofenix.com.br"
+BASE_URL = load_config().base_url
 logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
 class FetcherConfig:
-    user_agent: str = "consorcio-fenix-scraper/0.1 (+https://github.com/)"
-    timeout_seconds: float = 20.0
-    retries: int = 2
-    rate_limit_seconds: float = 0.5
+    user_agent: str = load_config().user_agent
+    timeout_seconds: float = load_config().http_timeout_seconds
+    retries: int = load_config().http_retries
+    rate_limit_seconds: float = load_config().http_rate_limit_seconds
 
 
 class HttpFetcher:

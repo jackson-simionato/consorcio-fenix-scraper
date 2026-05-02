@@ -5,9 +5,10 @@ from typing import Annotated
 
 import typer
 
+from consorcio_fenix_scraper.config import load_config
 from consorcio_fenix_scraper.db import hash_text, make_session_factory, persist_snapshots
 from consorcio_fenix_scraper.domain import RouteSnapshot, ScrapeRunResult
-from consorcio_fenix_scraper.http import BASE_URL, HttpFetcher, limited, parse_route_links
+from consorcio_fenix_scraper.http import HttpFetcher, limited, parse_route_links
 from consorcio_fenix_scraper.logging import configure_logging, get_logger
 from consorcio_fenix_scraper.parsers.kml import extract_kml, parse_kml_directions
 from consorcio_fenix_scraper.parsers.route_page import parse_route_page
@@ -27,7 +28,10 @@ def scrape_routes(
     database_url: Annotated[str | None, typer.Option(envvar="DATABASE_URL")] = None,
     dry_run: Annotated[bool, typer.Option(help="Parse and report counts without database writes.")] = False,
     limit: Annotated[int | None, typer.Option(help="Limit route count for smoke runs.")] = None,
-    source_url: Annotated[str, typer.Option(help="Route index URL to discover /horarios links.")] = f"{BASE_URL}/horarios",
+    source_url: Annotated[
+        str | None,
+        typer.Option(help="Route index URL to discover /horarios links."),
+    ] = None,
     route_html: Annotated[
         Path | None,
         typer.Option(help="Local route HTML fixture. When set, live fetching is skipped."),
@@ -37,6 +41,9 @@ def scrape_routes(
         typer.Option(help="Local map iframe HTML fixture used with --route-html."),
     ] = None,
 ) -> None:
+    config = load_config()
+    database_url = database_url or config.database_url
+    source_url = source_url or config.route_index_url
     configure_logging()
     logger.info("Starting route scrape")
     logger.info("Source URL: %s", source_url)
@@ -56,7 +63,7 @@ def scrape_routes(
 
     if not dry_run:
         if not database_url:
-            raise typer.BadParameter("--database-url or DATABASE_URL is required unless --dry-run is set")
+            raise typer.BadParameter("DATABASE_URL must not be empty unless --dry-run is set")
         session_factory = make_session_factory(database_url)
         with session_factory.begin() as session:
             result = persist_snapshots(session, source_url, snapshots)

@@ -1,4 +1,3 @@
-DATABASE_URL ?= postgresql+psycopg://postgres:postgres@localhost:5432/consorcio_fenix
 LIMIT ?= 3
 
 .PHONY: help sync db-up db-down db-logs migrate migrate-sql revision test compile dry-run scrape
@@ -9,7 +8,7 @@ help:
 	@printf "  make db-up        Start local PostGIS with Docker Compose\n"
 	@printf "  make db-down      Stop local PostGIS\n"
 	@printf "  make db-logs      Follow PostGIS logs\n"
-	@printf "  make migrate      Run Alembic migrations against DATABASE_URL\n"
+	@printf "  make migrate      Run Alembic migrations against the configured database\n"
 	@printf "  make migrate-sql  Render Alembic migration SQL without applying it\n"
 	@printf "  make revision     Create an Alembic revision: make revision MSG=\"message\"\n"
 	@printf "  make test         Run the test suite\n"
@@ -31,10 +30,10 @@ db-logs:
 	docker compose logs -f postgis
 
 migrate:
-	DATABASE_URL="$(DATABASE_URL)" uv run alembic upgrade head
+	uv run alembic upgrade head
 
 migrate-sql:
-	DATABASE_URL="$(DATABASE_URL)" uv run alembic upgrade head --sql
+	uv run alembic upgrade head --sql
 
 revision:
 	@if [ -z "$(MSG)" ]; then echo 'Usage: make revision MSG="message"'; exit 1; fi
@@ -52,4 +51,4 @@ dry-run:
 		--map-html tests/fixtures/map_page.html
 
 scrape:
-	DATABASE_URL="$(DATABASE_URL)" uv run consorcio-fenix scrape-routes --limit "$(LIMIT)"
+	uv run consorcio-fenix scrape-routes --limit "$(LIMIT)"

@@ -41,7 +41,6 @@ LOG_LEVEL=DEBUG make dry-run
 Run a limited live scrape:
 
 ```bash
-DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/consorcio_fenix \
 uv run consorcio-fenix scrape-routes --limit 3
 ```
 
@@ -50,6 +49,9 @@ Or:
 ```bash
 make scrape LIMIT=3
 ```
+
+The default `DATABASE_URL` points at the PostGIS service from `docker-compose.yml`.
+Override it with `DATABASE_URL=...` when targeting another database.
 
 ## Scope
 

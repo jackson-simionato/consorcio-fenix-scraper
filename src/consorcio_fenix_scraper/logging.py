@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import logging
-import os
+
+from consorcio_fenix_scraper.config import load_config
 
 
 PACKAGE_LOGGER_NAME = "consorcio_fenix_scraper"
-DEFAULT_LOG_LEVEL = "INFO"
 _HANDLER_MARKER = "_consorcio_fenix_console_handler"
 _LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 def configure_logging(level: str | None = None) -> None:
-    requested_level = level or os.getenv("LOG_LEVEL") or DEFAULT_LOG_LEVEL
+    requested_level = level or load_config().log_level
     resolved_level = _resolve_level(requested_level)
 
     package_logger = logging.getLogger(PACKAGE_LOGGER_NAME)
