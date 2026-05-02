@@ -11,11 +11,14 @@ KML_NS = {"kml": "http://www.opengis.net/kml/2.2"}
 
 
 def extract_kml(map_html: str) -> str:
+    stripped = map_html.strip()
+    if stripped.startswith("<?xml") or stripped.startswith("<kml"):
+        return stripped
     match = KML_TEXT_RE.search(map_html)
     if not match:
         raise ValueError("Could not find kmltext JavaScript assignment")
     value = match.group("value")
-    decoded = bytes(value, "utf-8").decode("unicode_escape")
+    decoded = bytes(value.replace("\\/", "/"), "utf-8").decode("unicode_escape")
     return html.unescape(decoded)
 
 
