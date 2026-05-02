@@ -1,5 +1,8 @@
+from consorcio_fenix_scraper.cli import app
+
+
 def main():
-    print("Hello from consorcio-fenix-scraper!")
+    app()
 
 
 if __name__ == "__main__":
