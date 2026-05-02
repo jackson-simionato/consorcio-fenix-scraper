@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -69,7 +70,7 @@ class ScrapeRunResult(BaseModel):
 
 
 class ScrapeRun(BaseModel):
-    id: int | None = None
+    id: UUID | None = None
     source_url: HttpUrl | str
     started_at: datetime
     finished_at: datetime | None = None

@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
 from hashlib import sha256
+from uuid import UUID as PyUUID, uuid4
 
 from geoalchemy2 import Geometry
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, Uuid, create_engine, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -20,10 +21,17 @@ class Base(DeclarativeBase):
     pass
 
 
+JSON_TYPE = JSON().with_variant(JSONB, "postgresql")
+
+
+def _uuid_pk():
+    return mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+
+
 class ScrapeRunRecord(Base):
     __tablename__ = "scrape_runs"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[PyUUID] = _uuid_pk()
     source_url: Mapped[str] = mapped_column(Text)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -34,7 +42,7 @@ class ScrapeRunRecord(Base):
 class RouteRecord(Base):
     __tablename__ = "routes"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[PyUUID] = _uuid_pk()
     code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     name: Mapped[str] = mapped_column(Text)
     slug: Mapped[str] = mapped_column(Text)
@@ -48,15 +56,24 @@ class RouteRecord(Base):
 
 class RouteVersionRecord(Base):
     __tablename__ = "route_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "route_id",
+            "source_hash",
+            "map_hash",
+            name="uq_route_versions_route_source_map_hash",
+            postgresql_nulls_not_distinct=True,
+        ),
+    )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    route_id: Mapped[int] = mapped_column(ForeignKey("routes.id"), index=True)
-    scrape_run_id: Mapped[int] = mapped_column(ForeignKey("scrape_runs.id"), index=True)
+    id: Mapped[PyUUID] = _uuid_pk()
+    route_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("routes.id"), index=True)
+    scrape_run_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("scrape_runs.id"), index=True)
     source_hash: Mapped[str] = mapped_column(String(64), index=True)
     map_hash: Mapped[str | None] = mapped_column(String(64))
     page_url: Mapped[str] = mapped_column(Text)
     map_url: Mapped[str | None] = mapped_column(Text)
-    snapshot: Mapped[dict] = mapped_column(JSONB)
+    snapshot: Mapped[dict] = mapped_column(JSON_TYPE)
     is_current: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
@@ -66,8 +83,8 @@ class RouteVersionRecord(Base):
 class RouteDirectionRecord(Base):
     __tablename__ = "route_directions"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    route_version_id: Mapped[int] = mapped_column(ForeignKey("route_versions.id"), index=True)
+    id: Mapped[PyUUID] = _uuid_pk()
+    route_version_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("route_versions.id"), index=True)
     name: Mapped[str] = mapped_column(Text)
     sequence: Mapped[int] = mapped_column(Integer)
     geometry: Mapped[object] = mapped_column(Geometry("LINESTRING", srid=4326))
@@ -76,19 +93,19 @@ class RouteDirectionRecord(Base):
 class ScheduleEntryRecord(Base):
     __tablename__ = "schedule_entries"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    route_version_id: Mapped[int] = mapped_column(ForeignKey("route_versions.id"), index=True)
+    id: Mapped[PyUUID] = _uuid_pk()
+    route_version_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("route_versions.id"), index=True)
     day_type: Mapped[str] = mapped_column(Text)
     departure_label: Mapped[str] = mapped_column(Text)
     time: Mapped[str] = mapped_column(String(5))
-    flags: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    flags: Mapped[list[str]] = mapped_column(JSON_TYPE, default=list)
 
 
 class ItineraryStepRecord(Base):
     __tablename__ = "itinerary_steps"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    route_version_id: Mapped[int] = mapped_column(ForeignKey("route_versions.id"), index=True)
+    id: Mapped[PyUUID] = _uuid_pk()
+    route_version_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("route_versions.id"), index=True)
     sequence: Mapped[int] = mapped_column(Integer)
     name: Mapped[str] = mapped_column(Text)
 
@@ -96,7 +113,7 @@ class ItineraryStepRecord(Base):
 class StopRecord(Base):
     __tablename__ = "stops"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[PyUUID] = _uuid_pk()
     external_id: Mapped[str | None] = mapped_column(Text, index=True)
     name: Mapped[str | None] = mapped_column(Text)
     source: Mapped[str] = mapped_column(Text)
@@ -107,8 +124,8 @@ class RawPageRecord(Base):
     __tablename__ = "raw_pages"
     __table_args__ = (UniqueConstraint("scrape_run_id", "url", name="uq_raw_page_run_url"),)
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    scrape_run_id: Mapped[int] = mapped_column(ForeignKey("scrape_runs.id"), index=True)
+    id: Mapped[PyUUID] = _uuid_pk()
+    scrape_run_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("scrape_runs.id"), index=True)
     url: Mapped[str] = mapped_column(Text)
     content_hash: Mapped[str] = mapped_column(String(64))
     content: Mapped[str] = mapped_column(Text)
@@ -131,12 +148,13 @@ def persist_snapshots(session: Session, source_url: str, snapshots: Iterable[Rou
     result = ScrapeRunResult()
     try:
         for snapshot in snapshots:
-            version = _persist_snapshot(session, run.id, snapshot)
+            version, created = _persist_snapshot(session, run.id, snapshot)
             result.routes += 1
             result.schedules += len(snapshot.route.schedules)
             result.geometries += len(snapshot.directions)
             result.itinerary_steps += len(snapshot.route.itinerary_steps)
-            _persist_children(session, version.id, snapshot)
+            if created:
+                _persist_children(session, version.id, snapshot)
             logger.info("Persisted route %s version id=%s", snapshot.route.code, version.id)
             logger.debug(
                 "Persisted route %s counts: schedules=%s directions=%s itinerary_steps=%s source_hash=%s map_hash=%s",
@@ -159,7 +177,7 @@ def persist_snapshots(session: Session, source_url: str, snapshots: Iterable[Rou
     return result
 
 
-def _persist_snapshot(session: Session, run_id: int, snapshot: RouteSnapshot) -> RouteVersionRecord:
+def _persist_snapshot(session: Session, run_id: PyUUID, snapshot: RouteSnapshot) -> tuple[RouteVersionRecord, bool]:
     route = session.scalar(select(RouteRecord).where(RouteRecord.code == snapshot.route.code))
     if route is None:
         route = RouteRecord(code=snapshot.route.code, name=snapshot.route.name, slug=snapshot.route.slug)
@@ -173,7 +191,20 @@ def _persist_snapshot(session: Session, run_id: int, snapshot: RouteSnapshot) ->
     route.last_changed = snapshot.route.last_changed
     route.is_current = True
 
+    existing_version = session.scalar(
+        select(RouteVersionRecord).where(
+            RouteVersionRecord.route_id == route.id,
+            RouteVersionRecord.source_hash == snapshot.source_hash,
+            RouteVersionRecord.map_hash.is_not_distinct_from(snapshot.map_hash),
+        )
+    )
+
     session.query(RouteVersionRecord).filter(RouteVersionRecord.route_id == route.id).update({"is_current": False})
+    if existing_version is not None:
+        existing_version.is_current = True
+        session.flush()
+        return existing_version, False
+
     version = RouteVersionRecord(
         route_id=route.id,
         scrape_run_id=run_id,
@@ -186,10 +217,10 @@ def _persist_snapshot(session: Session, run_id: int, snapshot: RouteSnapshot) ->
     )
     session.add(version)
     session.flush()
-    return version
+    return version, True
 
 
-def _persist_children(session: Session, route_version_id: int, snapshot: RouteSnapshot) -> None:
+def _persist_children(session: Session, route_version_id: PyUUID, snapshot: RouteSnapshot) -> None:
     for index, direction in enumerate(snapshot.directions, start=1):
         session.add(
             RouteDirectionRecord(

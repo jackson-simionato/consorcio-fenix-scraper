@@ -20,7 +20,7 @@ def upgrade() -> None:
     op.execute("CREATE EXTENSION IF NOT EXISTS postgis")
     op.create_table(
         "scrape_runs",
-        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("source_url", sa.Text(), nullable=False),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
@@ -30,7 +30,7 @@ def upgrade() -> None:
     )
     op.create_table(
         "routes",
-        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("code", sa.String(length=32), nullable=False),
         sa.Column("name", sa.Text(), nullable=False),
         sa.Column("slug", sa.Text(), nullable=False),
@@ -44,9 +44,9 @@ def upgrade() -> None:
     op.create_index(op.f("ix_routes_code"), "routes", ["code"], unique=False)
     op.create_table(
         "route_versions",
-        sa.Column("id", sa.Integer(), nullable=False),
-        sa.Column("route_id", sa.Integer(), nullable=False),
-        sa.Column("scrape_run_id", sa.Integer(), nullable=False),
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("route_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("scrape_run_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("source_hash", sa.String(length=64), nullable=False),
         sa.Column("map_hash", sa.String(length=64), nullable=True),
         sa.Column("page_url", sa.Text(), nullable=False),
@@ -57,6 +57,13 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["route_id"], ["routes.id"]),
         sa.ForeignKeyConstraint(["scrape_run_id"], ["scrape_runs.id"]),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "route_id",
+            "source_hash",
+            "map_hash",
+            name="uq_route_versions_route_source_map_hash",
+            postgresql_nulls_not_distinct=True,
+        ),
     )
     op.create_index(op.f("ix_route_versions_map_hash"), "route_versions", ["map_hash"], unique=False)
     op.create_index(op.f("ix_route_versions_route_id"), "route_versions", ["route_id"], unique=False)
@@ -64,8 +71,8 @@ def upgrade() -> None:
     op.create_index(op.f("ix_route_versions_source_hash"), "route_versions", ["source_hash"], unique=False)
     op.create_table(
         "route_directions",
-        sa.Column("id", sa.Integer(), nullable=False),
-        sa.Column("route_version_id", sa.Integer(), nullable=False),
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("route_version_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("name", sa.Text(), nullable=False),
         sa.Column("sequence", sa.Integer(), nullable=False),
         sa.Column("geometry", geoalchemy2.types.Geometry(geometry_type="LINESTRING", srid=4326), nullable=False),
@@ -75,8 +82,8 @@ def upgrade() -> None:
     op.create_index(op.f("ix_route_directions_route_version_id"), "route_directions", ["route_version_id"], unique=False)
     op.create_table(
         "schedule_entries",
-        sa.Column("id", sa.Integer(), nullable=False),
-        sa.Column("route_version_id", sa.Integer(), nullable=False),
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("route_version_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("day_type", sa.Text(), nullable=False),
         sa.Column("departure_label", sa.Text(), nullable=False),
         sa.Column("time", sa.String(length=5), nullable=False),
@@ -87,8 +94,8 @@ def upgrade() -> None:
     op.create_index(op.f("ix_schedule_entries_route_version_id"), "schedule_entries", ["route_version_id"], unique=False)
     op.create_table(
         "itinerary_steps",
-        sa.Column("id", sa.Integer(), nullable=False),
-        sa.Column("route_version_id", sa.Integer(), nullable=False),
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("route_version_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("sequence", sa.Integer(), nullable=False),
         sa.Column("name", sa.Text(), nullable=False),
         sa.ForeignKeyConstraint(["route_version_id"], ["route_versions.id"]),
@@ -97,7 +104,7 @@ def upgrade() -> None:
     op.create_index(op.f("ix_itinerary_steps_route_version_id"), "itinerary_steps", ["route_version_id"], unique=False)
     op.create_table(
         "stops",
-        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("external_id", sa.Text(), nullable=True),
         sa.Column("name", sa.Text(), nullable=True),
         sa.Column("source", sa.Text(), nullable=False),
@@ -107,8 +114,8 @@ def upgrade() -> None:
     op.create_index(op.f("ix_stops_external_id"), "stops", ["external_id"], unique=False)
     op.create_table(
         "raw_pages",
-        sa.Column("id", sa.Integer(), nullable=False),
-        sa.Column("scrape_run_id", sa.Integer(), nullable=False),
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("scrape_run_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("url", sa.Text(), nullable=False),
         sa.Column("content_hash", sa.String(length=64), nullable=False),
         sa.Column("content", sa.Text(), nullable=False),
