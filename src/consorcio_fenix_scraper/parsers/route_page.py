@@ -7,7 +7,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
 
-from consorcio_fenix_scraper.domain import ItineraryStep, ParsedRoutePage, ScheduleEntry
+from consorcio_fenix_scraper.domain import ItineraryStep, ParsedRoutePage, ScheduleEntry, ServiceDirection
 
 TIME_RE = re.compile(r"\b(\d{1,2}:\d{2})\b")
 FLAG_RE = re.compile(r"(?<!\w)([E*MR])(?!\w)")
@@ -18,6 +18,7 @@ def parse_route_page(html: str, page_url: str) -> ParsedRoutePage:
     code, name = _parse_title(soup, page_url)
     slug, _ = _route_identity_from_url(page_url)
     map_url = _extract_map_url(soup, page_url)
+    service_directions = _parse_service_directions(soup)
 
     return ParsedRoutePage(
         code=code,
@@ -28,6 +29,7 @@ def parse_route_page(html: str, page_url: str) -> ParsedRoutePage:
         category=_find_labeled_value(soup, "Categoria"),
         fare_cents=_parse_fare(_find_labeled_value(soup, "Tarifa")),
         last_changed=_parse_brazilian_date(_find_labeled_value(soup, "Última alteração")),
+        service_directions=service_directions,
         schedules=_parse_schedules(soup),
         itinerary_steps=_parse_itinerary(soup),
     )
@@ -122,6 +124,27 @@ def _parse_schedules(soup: BeautifulSoup) -> list[ScheduleEntry]:
     return schedules
 
 
+def _parse_service_directions(soup: BeautifulSoup) -> list[ServiceDirection]:
+    directions: list[ServiceDirection] = []
+    for sequence, tab in enumerate(soup.find_all(class_=re.compile(r"\bmy-subtab-content\b")), start=1):
+        if not isinstance(tab, Tag):
+            continue
+        heading = tab.find(re.compile("^h[1-6]$"))
+        label = _text(heading)
+        if not label:
+            continue
+        schedules = _parse_schedule_cards_in_group(tab, label)
+        if schedules:
+            directions.append(
+                ServiceDirection(
+                    sequence=sequence,
+                    departure_label=label,
+                    schedules=schedules,
+                )
+            )
+    return directions
+
+
 def _parse_schedule_cards(soup: BeautifulSoup) -> list[ScheduleEntry]:
     schedules: list[ScheduleEntry] = []
     for node in soup.find_all(attrs={"data-semana": True, "data-horario": True}):
@@ -132,6 +155,26 @@ def _parse_schedule_cards(soup: BeautifulSoup) -> list[ScheduleEntry]:
         if not day_type or not TIME_RE.fullmatch(time):
             continue
         label = _schedule_card_label(node)
+        schedules.append(
+            ScheduleEntry(
+                day_type=day_type,
+                departure_label=label,
+                time=time.zfill(5),
+                flags=tuple(FLAG_RE.findall(_text(node))),
+            )
+        )
+    return schedules
+
+
+def _parse_schedule_cards_in_group(group: Tag, label: str) -> list[ScheduleEntry]:
+    schedules: list[ScheduleEntry] = []
+    for node in group.find_all(attrs={"data-semana": True, "data-horario": True}):
+        if not isinstance(node, Tag):
+            continue
+        day_type = str(node["data-semana"]).strip()
+        time = str(node["data-horario"]).strip()
+        if not day_type or not TIME_RE.fullmatch(time):
+            continue
         schedules.append(
             ScheduleEntry(
                 day_type=day_type,

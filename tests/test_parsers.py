@@ -132,6 +132,22 @@ def test_route_page_parser_handles_live_schedule_cards_data_src_map_and_itinerar
         "TICEN - TERMINAL DE INTEGRAÇÃO DO CENTRO",
         "RUA PEDRO BITTENCOURT",
     ]
+    assert [(direction.sequence, direction.departure_label) for direction in route.service_directions] == [
+        (1, "Saída Abraão"),
+        (2, "Saída TICEN - Plataforma B - Box 9"),
+    ]
+    assert [
+        (entry.day_type, entry.departure_label, entry.time, entry.flags)
+        for entry in route.service_directions[0].schedules
+    ] == [
+        ("Dias Úteis", "Saída Abraão", "05:30", ("E", "M")),
+    ]
+    assert [
+        (entry.day_type, entry.departure_label, entry.time, entry.flags)
+        for entry in route.service_directions[1].schedules
+    ] == [
+        ("Sábado", "Saída TICEN - Plataforma B - Box 9", "00:15", ("E", "R")),
+    ]
     assert [(entry.day_type, entry.departure_label, entry.time, entry.flags) for entry in route.schedules] == [
         ("Dias Úteis", "Saída Abraão", "05:30", ("E", "M")),
         ("Sábado", "Saída TICEN - Plataforma B - Box 9", "00:15", ("E", "R")),

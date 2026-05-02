@@ -28,6 +28,20 @@ class ScheduleEntry(BaseModel):
     flags: tuple[str, ...] = Field(default_factory=tuple)
 
 
+class DirectionMatchConfidence(StrEnum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    NONE = "none"
+
+
+class DirectionMatchMethod(StrEnum):
+    LABEL_ENDPOINT = "label_endpoint"
+    LABEL_ORDER_IDA_VOLTA = "label_order_ida_volta"
+    SEQUENCE_IDA_VOLTA = "sequence_ida_volta"
+    UNMATCHED = "unmatched"
+
+
 class ItineraryStep(BaseModel):
     sequence: int
     name: str
@@ -39,6 +53,22 @@ class RouteDirection(BaseModel):
     geometry_type: Literal["LineString"] = "LineString"
 
 
+class ServiceDirection(BaseModel):
+    sequence: int
+    departure_label: str
+    normalized_name: str | None = None
+    direction_kind: str | None = None
+    schedules: list[ScheduleEntry] = Field(default_factory=list)
+
+
+class ServiceDirectionMatch(BaseModel):
+    service_direction_sequence: int
+    route_direction_sequence: int | None = None
+    confidence: DirectionMatchConfidence = DirectionMatchConfidence.NONE
+    method: DirectionMatchMethod = DirectionMatchMethod.UNMATCHED
+    notes: dict[str, str] = Field(default_factory=dict)
+
+
 class ParsedRoutePage(BaseModel):
     code: str
     name: str
@@ -48,6 +78,7 @@ class ParsedRoutePage(BaseModel):
     category: str | None = None
     fare_cents: int | None = None
     last_changed: date | None = None
+    service_directions: list[ServiceDirection] = Field(default_factory=list)
     schedules: list[ScheduleEntry] = Field(default_factory=list)
     itinerary_steps: list[ItineraryStep] = Field(default_factory=list)
 
@@ -55,6 +86,7 @@ class ParsedRoutePage(BaseModel):
 class RouteSnapshot(BaseModel):
     route: ParsedRoutePage
     directions: list[RouteDirection] = Field(default_factory=list)
+    direction_matches: list[ServiceDirectionMatch] = Field(default_factory=list)
     source_hash: str
     map_hash: str | None = None
 
