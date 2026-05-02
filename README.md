@@ -32,6 +32,12 @@ Or:
 make dry-run
 ```
 
+Set `LOG_LEVEL=DEBUG` for more detailed scraper diagnostics:
+
+```bash
+LOG_LEVEL=DEBUG make dry-run
+```
+
 Run a limited live scrape:
 
 ```bash

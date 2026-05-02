@@ -15,6 +15,7 @@ help:
 	@printf "  make test         Run the test suite\n"
 	@printf "  make compile      Compile src and tests\n"
 	@printf "  make dry-run      Parse bundled fixture pages without database writes\n"
+	@printf "                    Use LOG_LEVEL=DEBUG make dry-run for verbose logs\n"
 	@printf "  make scrape       Run a limited live scrape: make scrape LIMIT=3\n"
 
 sync:

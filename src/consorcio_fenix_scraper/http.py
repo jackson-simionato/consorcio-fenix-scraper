@@ -9,8 +9,11 @@ from urllib.parse import urljoin
 import httpx
 from bs4 import BeautifulSoup
 
+from consorcio_fenix_scraper.logging import get_logger
+
 
 BASE_URL = "https://www.consorciofenix.com.br"
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -37,23 +40,30 @@ class HttpFetcher:
         for attempt in range(self.config.retries + 1):
             try:
                 if attempt:
+                    logger.info("Retrying fetch attempt %s/%s: %s", attempt + 1, self.config.retries + 1, url)
                     time.sleep(self.config.rate_limit_seconds)
+                logger.debug("Fetching URL: %s", url)
                 response = self.client.get(url)
                 response.raise_for_status()
                 return response.text
             except httpx.HTTPError as exc:
                 last_error = exc
+                logger.warning("Fetch attempt %s/%s failed for %s: %s", attempt + 1, self.config.retries + 1, url, exc)
+        logger.error("Failed to fetch %s after %s attempts", url, self.config.retries + 1)
         raise RuntimeError(f"Failed to fetch {url}: {last_error}") from last_error
 
     def assert_allowed(self, url: str) -> None:
         robots = self._load_robots(url)
+        logger.debug("Checking robots.txt permission for %s", url)
         if not robots.can_fetch(self.config.user_agent, url):
+            logger.error("robots.txt disallows fetching %s", url)
             raise PermissionError(f"robots.txt disallows fetching {url}")
 
     def _load_robots(self, url: str) -> robotparser.RobotFileParser:
         if self._robots is not None:
             return self._robots
         robots_url = urljoin(url, "/robots.txt")
+        logger.info("Fetching robots.txt: %s", robots_url)
         response = self.client.get(robots_url)
         response.raise_for_status()
         parser = robotparser.RobotFileParser()

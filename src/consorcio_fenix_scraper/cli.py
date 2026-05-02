@@ -8,11 +8,13 @@ import typer
 from consorcio_fenix_scraper.db import hash_text, make_session_factory, persist_snapshots
 from consorcio_fenix_scraper.domain import RouteSnapshot, ScrapeRunResult
 from consorcio_fenix_scraper.http import BASE_URL, HttpFetcher, limited, parse_route_links
+from consorcio_fenix_scraper.logging import configure_logging, get_logger
 from consorcio_fenix_scraper.parsers.kml import extract_kml, parse_kml_directions
 from consorcio_fenix_scraper.parsers.route_page import parse_route_page
 from consorcio_fenix_scraper.stops import FloripaNoPontoStopAdapter
 
 app = typer.Typer(no_args_is_help=True)
+logger = get_logger(__name__)
 
 
 @app.callback()
@@ -35,6 +37,16 @@ def scrape_routes(
         typer.Option(help="Local map iframe HTML fixture used with --route-html."),
     ] = None,
 ) -> None:
+    configure_logging()
+    logger.info("Starting route scrape")
+    logger.info("Source URL: %s", source_url)
+    if limit is not None:
+        logger.info("Route limit: %s", limit)
+    if dry_run:
+        logger.info("Running in dry-run mode; database writes disabled")
+    else:
+        logger.info("Running in database write mode")
+
     snapshots = _load_fixture_snapshots(route_html, map_html) if route_html else _fetch_live_snapshots(source_url, limit)
     result = _summarize_snapshots(snapshots)
 
@@ -51,31 +63,61 @@ def scrape_routes(
             if stop_result.status != "success":
                 result.warnings.append(f"stop_adapter={stop_result.status}: {stop_result.message}")
 
+    logger.info("Completed route scrape: %s", _format_result(result))
     typer.echo(_format_result(result))
 
 
 def _load_fixture_snapshots(route_html: Path | None, map_html: Path | None) -> list[RouteSnapshot]:
     if route_html is None:
         return []
+    logger.info("Loading route fixture: %s", route_html)
     route_text = route_html.read_text()
     page_url = "https://www.consorciofenix.com.br/horarios/ticen-titri-via-mauro-ramos,110"
     route = parse_route_page(route_text, page_url=page_url)
     map_text = map_html.read_text() if map_html else ""
+    if map_html:
+        logger.info("Loading map fixture: %s", map_html)
     directions = parse_kml_directions(extract_kml(map_text)) if map_text else []
-    return [RouteSnapshot(route=route, directions=directions, source_hash=hash_text(route_text), map_hash=hash_text(map_text) if map_text else None)]
+    source_hash = hash_text(route_text)
+    map_hash = hash_text(map_text) if map_text else None
+    logger.debug(
+        "Parsed fixture route code=%s schedules=%s directions=%s source_hash=%s map_hash=%s",
+        route.code,
+        len(route.schedules),
+        len(directions),
+        source_hash,
+        map_hash,
+    )
+    return [RouteSnapshot(route=route, directions=directions, source_hash=source_hash, map_hash=map_hash)]
 
 
 def _fetch_live_snapshots(source_url: str, limit: int | None) -> list[RouteSnapshot]:
     fetcher = HttpFetcher()
     try:
+        logger.info("Fetching route index: %s", source_url)
         index_html = fetcher.get_text(source_url)
         route_urls = limited(parse_route_links(index_html), limit)
+        logger.info("Discovered %s route links", len(route_urls))
         snapshots: list[RouteSnapshot] = []
-        for route_url in route_urls:
+        for index, route_url in enumerate(route_urls, start=1):
+            logger.info("Fetching route %s/%s: %s", index, len(route_urls), route_url)
             route_html = fetcher.get_text(route_url)
             route = parse_route_page(route_html, page_url=route_url)
             map_text = fetcher.get_text(route.map_url) if route.map_url else ""
             directions = parse_kml_directions(extract_kml(map_text)) if map_text else []
+            logger.info(
+                "Parsed route %s: schedules=%s directions=%s itinerary_steps=%s",
+                route.code,
+                len(route.schedules),
+                len(directions),
+                len(route.itinerary_steps),
+            )
+            logger.debug(
+                "Route %s hashes: source_hash=%s map_hash=%s",
+                route.code,
+                hash_text(route_html),
+                hash_text(map_text) if map_text else None,
+            )
             snapshots.append(
                 RouteSnapshot(
                     route=route,

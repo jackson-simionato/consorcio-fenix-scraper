@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from consorcio_fenix_scraper.logging import get_logger
+
+
+logger = get_logger(__name__)
+
 
 @dataclass(frozen=True)
 class StopDiscoveryResult:
@@ -15,4 +20,7 @@ class FloripaNoPontoStopAdapter:
     """Placeholder adapter boundary for public stop-coordinate discovery."""
 
     def discover(self) -> StopDiscoveryResult:
-        return StopDiscoveryResult()
+        result = StopDiscoveryResult()
+        if result.status != "success":
+            logger.warning("Stop adapter %s status=%s: %s", result.source, result.status, result.message)
+        return result

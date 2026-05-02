@@ -10,6 +10,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 from consorcio_fenix_scraper.domain import RouteDirection, RouteSnapshot, ScrapeRunResult, ScrapeStatus
+from consorcio_fenix_scraper.logging import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -122,6 +126,7 @@ def persist_snapshots(session: Session, source_url: str, snapshots: Iterable[Rou
     run = ScrapeRunRecord(source_url=source_url, status=ScrapeStatus.RUNNING.value)
     session.add(run)
     session.flush()
+    logger.info("Created scrape run id=%s source_url=%s", run.id, source_url)
 
     result = ScrapeRunResult()
     try:
@@ -132,10 +137,22 @@ def persist_snapshots(session: Session, source_url: str, snapshots: Iterable[Rou
             result.geometries += len(snapshot.directions)
             result.itinerary_steps += len(snapshot.route.itinerary_steps)
             _persist_children(session, version.id, snapshot)
+            logger.info("Persisted route %s version id=%s", snapshot.route.code, version.id)
+            logger.debug(
+                "Persisted route %s counts: schedules=%s directions=%s itinerary_steps=%s source_hash=%s map_hash=%s",
+                snapshot.route.code,
+                len(snapshot.route.schedules),
+                len(snapshot.directions),
+                len(snapshot.route.itinerary_steps),
+                snapshot.source_hash,
+                snapshot.map_hash,
+            )
         run.status = ScrapeStatus.SUCCESS.value
+        logger.info("Finished scrape run id=%s status=%s routes=%s", run.id, run.status, result.routes)
     except Exception as exc:
         run.status = ScrapeStatus.FAILED.value
         run.error_summary = str(exc)
+        logger.exception("Scrape run id=%s failed: %s", run.id, exc)
         raise
     finally:
         run.finished_at = datetime.now(UTC)
