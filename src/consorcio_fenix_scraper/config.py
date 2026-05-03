@@ -21,6 +21,7 @@ class ProjectConfig(BaseSettings):
     http_timeout_seconds: float = Field(default=20.0, validation_alias="CONSORCIO_FENIX_HTTP_TIMEOUT_SECONDS")
     http_retries: int = Field(default=2, validation_alias="CONSORCIO_FENIX_HTTP_RETRIES")
     http_rate_limit_seconds: float = Field(default=0.5, validation_alias="CONSORCIO_FENIX_HTTP_RATE_LIMIT_SECONDS")
+    http_concurrency: int = Field(default=4, validation_alias="CONSORCIO_FENIX_HTTP_CONCURRENCY")
 
     @cached_property
     def route_index_url(self) -> str:

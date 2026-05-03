@@ -44,6 +44,13 @@ Run a limited live scrape:
 uv run consorcio-fenix scrape-routes --limit 3
 ```
 
+Live route pages and map pages are fetched concurrently. The default is 4 concurrent routes:
+
+```bash
+uv run consorcio-fenix scrape-routes --limit 10 --concurrency 4
+CONSORCIO_FENIX_HTTP_CONCURRENCY=4 uv run consorcio-fenix scrape-routes --limit 10
+```
+
 Or:
 
 ```bash

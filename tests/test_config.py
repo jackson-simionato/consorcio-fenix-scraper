@@ -15,6 +15,7 @@ def test_project_config_defaults_match_local_docker_workflow(monkeypatch):
     assert config.http_timeout_seconds == 20.0
     assert config.http_retries == 2
     assert config.http_rate_limit_seconds == 0.5
+    assert config.http_concurrency == 4
 
 
 def test_project_config_reads_environment_overrides(monkeypatch):
@@ -22,6 +23,7 @@ def test_project_config_reads_environment_overrides(monkeypatch):
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("CONSORCIO_FENIX_BASE_URL", "https://example.test")
     monkeypatch.setenv("CONSORCIO_FENIX_HTTP_RETRIES", "5")
+    monkeypatch.setenv("CONSORCIO_FENIX_HTTP_CONCURRENCY", "7")
 
     config = ProjectConfig()
 
@@ -30,3 +32,4 @@ def test_project_config_reads_environment_overrides(monkeypatch):
     assert config.base_url == "https://example.test"
     assert config.route_index_url == "https://example.test/horarios"
     assert config.http_retries == 5
+    assert config.http_concurrency == 7
