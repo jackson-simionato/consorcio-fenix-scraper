@@ -53,6 +53,17 @@ class RouteDirection(BaseModel):
     geometry_type: Literal["LineString"] = "LineString"
 
 
+class MaterializedRouteSegment(BaseModel):
+    sequence: int
+    source_segment_sequence: int
+    source_fraction_start: float
+    source_fraction_end: float
+    coordinates: list[tuple[float, float]]
+    bearing_degrees: float
+    distance_meters: float
+    cumulative_distance_meters: float
+
+
 class ServiceDirection(BaseModel):
     sequence: int
     departure_label: str
