@@ -154,6 +154,52 @@ def test_route_page_parser_handles_live_schedule_cards_data_src_map_and_itinerar
     ]
 
 
+def test_route_page_parser_deduplicates_repeated_responsive_service_direction_blocks():
+    html = """
+    <html><body>
+      <h1>665 - Abraão</h1>
+      <div class="content-horarios-int">
+        <div class="my-subtab-content">
+          <h5>Saída Abraão</h5>
+          <div class="row row-horarios">
+            <div data-semana="Dias Úteis" data-horario="05:30"><a>05:30 <b>E M</b></a></div>
+          </div>
+        </div>
+        <div class="my-subtab-content">
+          <h5>Saída TICEN - Plataforma B - Box 9</h5>
+          <div class="row row-horarios">
+            <div data-semana="Sábado" data-horario="00:15"><a>00:15 <b>E R</b></a></div>
+          </div>
+        </div>
+        <div class="my-subtab-content">
+          <h5>Saída Abraão</h5>
+          <div class="row row-horarios">
+            <div data-semana="Dias Úteis" data-horario="05:30"><a>05:30 <b>E M</b></a></div>
+          </div>
+        </div>
+        <div class="my-subtab-content">
+          <h5>Saída TICEN - Plataforma B - Box 9</h5>
+          <div class="row row-horarios">
+            <div data-semana="Sábado" data-horario="00:15"><a>00:15 <b>E R</b></a></div>
+          </div>
+        </div>
+      </div>
+    </body></html>
+    """
+
+    route = parse_route_page(html, page_url="https://www.consorciofenix.com.br/horarios/abraao,665")
+
+    assert [(direction.sequence, direction.departure_label) for direction in route.service_directions] == [
+        (1, "Saída Abraão"),
+        (2, "Saída TICEN - Plataforma B - Box 9"),
+    ]
+    assert len(route.schedules) == 2
+    assert [(entry.day_type, entry.departure_label, entry.time) for entry in route.schedules] == [
+        ("Dias Úteis", "Saída Abraão", "05:30"),
+        ("Sábado", "Saída TICEN - Plataforma B - Box 9", "00:15"),
+    ]
+
+
 def test_kml_parser_extracts_linestrings_with_lon_lat_order():
     html = (FIXTURES / "map_page.html").read_text()
 

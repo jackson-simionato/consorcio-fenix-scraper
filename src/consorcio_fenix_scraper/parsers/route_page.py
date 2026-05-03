@@ -19,6 +19,7 @@ def parse_route_page(html: str, page_url: str) -> ParsedRoutePage:
     slug, _ = _route_identity_from_url(page_url)
     map_url = _extract_map_url(soup, page_url)
     service_directions = _parse_service_directions(soup)
+    schedules = [entry for direction in service_directions for entry in direction.schedules]
 
     return ParsedRoutePage(
         code=code,
@@ -125,7 +126,7 @@ def _parse_schedules(soup: BeautifulSoup) -> list[ScheduleEntry]:
 
 
 def _parse_service_directions(soup: BeautifulSoup) -> list[ServiceDirection]:
-    directions: list[ServiceDirection] = []
+    directions_by_label: dict[str, ServiceDirection] = {}
     for sequence, tab in enumerate(soup.find_all(class_=re.compile(r"\bmy-subtab-content\b")), start=1):
         if not isinstance(tab, Tag):
             continue
@@ -134,19 +135,56 @@ def _parse_service_directions(soup: BeautifulSoup) -> list[ServiceDirection]:
         if not label:
             continue
         schedules = _parse_schedule_cards_in_group(tab, label)
-        if schedules:
-            directions.append(
-                ServiceDirection(
-                    sequence=sequence,
-                    departure_label=label,
-                    schedules=schedules,
-                )
+        if not schedules:
+            continue
+        direction = directions_by_label.get(label)
+        if direction is None:
+            directions_by_label[label] = ServiceDirection(
+                sequence=sequence,
+                departure_label=label,
+                schedules=schedules,
             )
-    return directions
+            continue
+        direction.schedules.extend(
+            entry for entry in schedules if _schedule_key(entry) not in {_schedule_key(existing) for existing in direction.schedules}
+        )
+    if directions_by_label:
+        return sorted(directions_by_label.values(), key=lambda direction: direction.sequence)
+    return _parse_table_service_directions(soup)
+
+
+def _parse_table_service_directions(soup: BeautifulSoup) -> list[ServiceDirection]:
+    grouped: dict[str, list[ScheduleEntry]] = {}
+    order: list[str] = []
+    root = soup.find(id=re.compile("horario", re.IGNORECASE)) or soup
+    for table in root.find_all("table"):
+        day_type = _table_day_type(table)
+        if not day_type:
+            continue
+        headers = [_text(cell) for cell in table.find_all("th")]
+        if not headers:
+            continue
+        for row in table.find_all("tr"):
+            cells = row.find_all("td")
+            for index, cell in enumerate(cells):
+                label = headers[index] if index < len(headers) else headers[-1]
+                if label not in grouped:
+                    grouped[label] = []
+                    order.append(label)
+                entries = _parse_schedule_cell(day_type, label, _text(cell))
+                for entry in entries:
+                    if _schedule_key(entry) not in {_schedule_key(existing) for existing in grouped[label]}:
+                        grouped[label].append(entry)
+    return [
+        ServiceDirection(sequence=index, departure_label=label, schedules=grouped[label])
+        for index, label in enumerate(order, start=1)
+        if grouped[label]
+    ]
 
 
 def _parse_schedule_cards(soup: BeautifulSoup) -> list[ScheduleEntry]:
     schedules: list[ScheduleEntry] = []
+    seen: set[tuple[str, str, str, tuple[str, ...]]] = set()
     for node in soup.find_all(attrs={"data-semana": True, "data-horario": True}):
         if not isinstance(node, Tag):
             continue
@@ -155,19 +193,22 @@ def _parse_schedule_cards(soup: BeautifulSoup) -> list[ScheduleEntry]:
         if not day_type or not TIME_RE.fullmatch(time):
             continue
         label = _schedule_card_label(node)
-        schedules.append(
-            ScheduleEntry(
-                day_type=day_type,
-                departure_label=label,
-                time=time.zfill(5),
-                flags=tuple(FLAG_RE.findall(_text(node))),
-            )
+        entry = ScheduleEntry(
+            day_type=day_type,
+            departure_label=label,
+            time=time.zfill(5),
+            flags=tuple(FLAG_RE.findall(_text(node))),
         )
+        key = _schedule_key(entry)
+        if key not in seen:
+            seen.add(key)
+            schedules.append(entry)
     return schedules
 
 
 def _parse_schedule_cards_in_group(group: Tag, label: str) -> list[ScheduleEntry]:
     schedules: list[ScheduleEntry] = []
+    seen: set[tuple[str, str, str, tuple[str, ...]]] = set()
     for node in group.find_all(attrs={"data-semana": True, "data-horario": True}):
         if not isinstance(node, Tag):
             continue
@@ -175,15 +216,21 @@ def _parse_schedule_cards_in_group(group: Tag, label: str) -> list[ScheduleEntry
         time = str(node["data-horario"]).strip()
         if not day_type or not TIME_RE.fullmatch(time):
             continue
-        schedules.append(
-            ScheduleEntry(
-                day_type=day_type,
-                departure_label=label,
-                time=time.zfill(5),
-                flags=tuple(FLAG_RE.findall(_text(node))),
-            )
+        entry = ScheduleEntry(
+            day_type=day_type,
+            departure_label=label,
+            time=time.zfill(5),
+            flags=tuple(FLAG_RE.findall(_text(node))),
         )
+        key = _schedule_key(entry)
+        if key not in seen:
+            seen.add(key)
+            schedules.append(entry)
     return schedules
+
+
+def _schedule_key(entry: ScheduleEntry) -> tuple[str, str, str, tuple[str, ...]]:
+    return entry.day_type, entry.departure_label, entry.time, entry.flags
 
 
 def _schedule_card_label(node: Tag) -> str:
