@@ -1,0 +1,3 @@
+# Separate Sun Advisory App Consumes the Scraper Database
+
+The scraper remains responsible for collecting, versioning, and migrating Consorcio Fenix route data, while a separate sun advisory app will consume the scraper database read-only for nearby route discovery and onboard sun-side advisories. The scraper materializes route segments but does not precompute sun exposure; the advisory app computes exposure live from route segments, request datetime, and projected passenger position. This keeps ingestion concerns isolated from passenger-facing advisory logic while sharing the PostGIS route and segment read model needed by both, and prevents the advisory app from mutating scraper-owned route data.

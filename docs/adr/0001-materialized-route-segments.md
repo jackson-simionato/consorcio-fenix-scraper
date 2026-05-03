@@ -1,0 +1,3 @@
+# Materialized Route Segments
+
+We will persist route segments derived from each directed route geometry, including `route_version_id`, sequence, segment geometry, bearing, distance, cumulative distance, and source-segment lineage. Source KML vertex segments are preserved when practical, but any source segment longer than 250 meters is split into smaller materialized segments so one coarse source gap does not dominate sun exposure or upcoming-window calculations. Sun exposure queries and nearby route discovery need these values for every route segment, so storing them as a route-version child read model with geospatial proximity indexing keeps requests inspectable and avoids repeating geospatial splitting and bearing calculations on every advisory query.
