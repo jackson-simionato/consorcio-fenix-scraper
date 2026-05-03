@@ -8,6 +8,7 @@ from sqlalchemy.pool import StaticPool
 
 from consorcio_fenix_scraper.db import (
     Base,
+    FareVersionRecord,
     RouteDirectionRecord,
     RouteRecord,
     RouteVersionRecord,
@@ -20,6 +21,7 @@ from consorcio_fenix_scraper.db import (
 from consorcio_fenix_scraper.domain import (
     DirectionMatchConfidence,
     DirectionMatchMethod,
+    FarePolicy,
     ParsedRoutePage,
     RouteDirection,
     RouteSnapshot,
@@ -41,6 +43,7 @@ def db_session():
         engine,
         tables=[
             ScrapeRunRecord.__table__,
+            FareVersionRecord.__table__,
             RouteRecord.__table__,
             RouteVersionRecord.__table__,
             RouteDirectionRecord.__table__,
@@ -53,7 +56,11 @@ def db_session():
         yield session
 
 
-def _snapshot(source_hash: str = "source-a", map_hash: str | None = "map-a") -> RouteSnapshot:
+def _snapshot(
+    source_hash: str = "source-a",
+    map_hash: str | None = "map-a",
+    cash_qrcode_pix_cents: int = 770,
+) -> RouteSnapshot:
     return RouteSnapshot(
         route=ParsedRoutePage(
             code="110",
@@ -62,7 +69,13 @@ def _snapshot(source_hash: str = "source-a", map_hash: str | None = "map-a") -> 
             page_url="https://www.consorciofenix.com.br/horarios/ticen-titri,110",
             map_url="https://www.consorciofenix.com.br/mapa/110",
             category="convencional",
-            fare_cents=600,
+            fare_region="Região Única",
+            fare_policy=FarePolicy(
+                region="Região Única",
+                citizen_card_cents=620,
+                vt_tourist_card_cents=720,
+                cash_qrcode_pix_cents=cash_qrcode_pix_cents,
+            ),
             last_changed=date(2026, 5, 2),
         ),
         source_hash=source_hash,
@@ -120,6 +133,51 @@ def test_creates_new_route_version_when_map_hash_changes(db_session: Session):
     assert second.is_current is True
 
 
+def test_persists_route_metadata_and_links_route_version_to_fare_version(db_session: Session):
+    version, created = _persist_snapshot(db_session, uuid4(), _snapshot())
+
+    route = db_session.query(RouteRecord).one()
+    fare_version = db_session.query(FareVersionRecord).one()
+
+    assert created is True
+    assert route.category == "convencional"
+    assert route.fare_region == "Região Única"
+    assert route.last_changed == date(2026, 5, 2)
+    assert fare_version.region == "Região Única"
+    assert fare_version.citizen_card_cents == 620
+    assert fare_version.vt_tourist_card_cents == 720
+    assert fare_version.cash_qrcode_pix_cents == 770
+    assert len(fare_version.source_hash) == 64
+    assert fare_version.source_url == "https://www.consorciofenix.com.br/horarios/ticen-titri,110"
+    assert fare_version.is_current is True
+    assert version.fare_version_id == fare_version.id
+
+
+def test_reuses_existing_fare_version_for_same_policy_when_route_source_hash_changes(db_session: Session):
+    _persist_snapshot(db_session, uuid4(), _snapshot(source_hash="source-a"))
+    _persist_snapshot(db_session, uuid4(), _snapshot(source_hash="source-b"))
+
+    fare_versions = db_session.query(FareVersionRecord).all()
+
+    assert len(fare_versions) == 1
+
+
+def test_marks_previous_fare_version_non_current_when_fare_policy_changes(db_session: Session):
+    first_version, _ = _persist_snapshot(db_session, uuid4(), _snapshot(source_hash="source-a"))
+    second_version, _ = _persist_snapshot(
+        db_session,
+        uuid4(),
+        _snapshot(source_hash="source-b", cash_qrcode_pix_cents=790),
+    )
+
+    fare_versions = db_session.query(FareVersionRecord).order_by(FareVersionRecord.cash_qrcode_pix_cents).all()
+
+    assert first_version.fare_version_id == fare_versions[0].id
+    assert second_version.fare_version_id == fare_versions[1].id
+    assert {fare.cash_qrcode_pix_cents for fare in fare_versions} == {770, 790}
+    assert [fare.is_current for fare in fare_versions] == [False, True]
+
+
 def test_linestring_wkt_uses_srid_4326_and_lon_lat_order():
     direction = RouteDirection(name="Ida", coordinates=[(-48.548, -27.5969), (-48.544, -27.59)])
 
@@ -135,7 +193,13 @@ def test_persists_service_directions_and_links_schedules_through_matches(db_sess
             page_url="https://www.consorciofenix.com.br/horarios/ticen-titri,110",
             map_url="https://www.consorciofenix.com.br/mapa/110",
             category="convencional",
-            fare_cents=600,
+            fare_region="Região Única",
+            fare_policy=FarePolicy(
+                region="Região Única",
+                citizen_card_cents=620,
+                vt_tourist_card_cents=720,
+                cash_qrcode_pix_cents=770,
+            ),
             last_changed=date(2026, 5, 2),
             service_directions=[
                 ServiceDirection(

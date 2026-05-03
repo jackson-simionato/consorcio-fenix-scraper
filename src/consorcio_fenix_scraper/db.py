@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
 from hashlib import sha256
 from uuid import UUID as PyUUID, uuid4
 
 from geoalchemy2 import Geometry
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, Uuid, create_engine, select
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, Uuid, create_engine, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 from consorcio_fenix_scraper.domain import (
     DirectionMatchConfidence,
     DirectionMatchMethod,
+    FarePolicy,
     RouteDirection,
     RouteSnapshot,
     ScrapeRunResult,
@@ -50,6 +52,24 @@ class ScrapeRunRecord(Base):
     error_summary: Mapped[str | None] = mapped_column(Text)
 
 
+class FareVersionRecord(Base):
+    __tablename__ = "fare_versions"
+    __table_args__ = (
+        UniqueConstraint("region", "source_hash", name="uq_fare_versions_region_source_hash"),
+        Index("ix_fare_versions_region_is_current", "region", "is_current"),
+    )
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    region: Mapped[str] = mapped_column(Text, index=True)
+    citizen_card_cents: Mapped[int | None] = mapped_column(Integer)
+    vt_tourist_card_cents: Mapped[int | None] = mapped_column(Integer)
+    cash_qrcode_pix_cents: Mapped[int | None] = mapped_column(Integer)
+    source_hash: Mapped[str] = mapped_column(String(64))
+    source_url: Mapped[str] = mapped_column(Text)
+    is_current: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
 class RouteRecord(Base):
     __tablename__ = "routes"
 
@@ -58,7 +78,7 @@ class RouteRecord(Base):
     name: Mapped[str] = mapped_column(Text)
     slug: Mapped[str] = mapped_column(Text)
     category: Mapped[str | None] = mapped_column(Text)
-    fare_cents: Mapped[int | None] = mapped_column(Integer)
+    fare_region: Mapped[str | None] = mapped_column(Text)
     last_changed: Mapped[date | None] = mapped_column(Date)
     is_current: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -80,6 +100,7 @@ class RouteVersionRecord(Base):
     id: Mapped[PyUUID] = _uuid_pk()
     route_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("routes.id"), index=True)
     scrape_run_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("scrape_runs.id"), index=True)
+    fare_version_id: Mapped[PyUUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("fare_versions.id"), index=True)
     source_hash: Mapped[str] = mapped_column(String(64), index=True)
     map_hash: Mapped[str | None] = mapped_column(String(64))
     page_url: Mapped[str] = mapped_column(Text)
@@ -223,9 +244,10 @@ def _persist_snapshot(session: Session, run_id: PyUUID, snapshot: RouteSnapshot)
     route.name = snapshot.route.name
     route.slug = snapshot.route.slug
     route.category = snapshot.route.category
-    route.fare_cents = snapshot.route.fare_cents
+    route.fare_region = snapshot.route.fare_region
     route.last_changed = snapshot.route.last_changed
     route.is_current = True
+    fare_version = _persist_fare_version(session, snapshot)
 
     existing_version = session.scalar(
         select(RouteVersionRecord).where(
@@ -237,6 +259,7 @@ def _persist_snapshot(session: Session, run_id: PyUUID, snapshot: RouteSnapshot)
 
     session.query(RouteVersionRecord).filter(RouteVersionRecord.route_id == route.id).update({"is_current": False})
     if existing_version is not None:
+        existing_version.fare_version_id = fare_version.id if fare_version is not None else None
         existing_version.is_current = True
         session.flush()
         return existing_version, False
@@ -244,6 +267,7 @@ def _persist_snapshot(session: Session, run_id: PyUUID, snapshot: RouteSnapshot)
     version = RouteVersionRecord(
         route_id=route.id,
         scrape_run_id=run_id,
+        fare_version_id=fare_version.id if fare_version is not None else None,
         source_hash=snapshot.source_hash,
         map_hash=snapshot.map_hash,
         page_url=snapshot.route.page_url,
@@ -254,6 +278,46 @@ def _persist_snapshot(session: Session, run_id: PyUUID, snapshot: RouteSnapshot)
     session.add(version)
     session.flush()
     return version, True
+
+
+def _persist_fare_version(session: Session, snapshot: RouteSnapshot) -> FareVersionRecord | None:
+    fare_policy = snapshot.route.fare_policy
+    if fare_policy is None:
+        return None
+
+    existing = session.scalar(
+        select(FareVersionRecord).where(
+            FareVersionRecord.region == fare_policy.region,
+            FareVersionRecord.source_hash == _fare_policy_hash(fare_policy),
+        )
+    )
+    if existing is None:
+        session.query(FareVersionRecord).filter(FareVersionRecord.region == fare_policy.region).update({"is_current": False})
+        existing = FareVersionRecord(
+            region=fare_policy.region,
+            citizen_card_cents=fare_policy.citizen_card_cents,
+            vt_tourist_card_cents=fare_policy.vt_tourist_card_cents,
+            cash_qrcode_pix_cents=fare_policy.cash_qrcode_pix_cents,
+            source_hash=_fare_policy_hash(fare_policy),
+            source_url=snapshot.route.page_url,
+            is_current=True,
+        )
+        session.add(existing)
+        session.flush()
+        return existing
+
+    session.query(FareVersionRecord).filter(
+        FareVersionRecord.region == fare_policy.region,
+        FareVersionRecord.id != existing.id,
+    ).update({"is_current": False})
+    existing.is_current = True
+    session.flush()
+    return existing
+
+
+def _fare_policy_hash(fare_policy: FarePolicy) -> str:
+    payload = json.dumps(fare_policy.model_dump(), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _persist_children(session: Session, route_version_id: PyUUID, snapshot: RouteSnapshot) -> None:

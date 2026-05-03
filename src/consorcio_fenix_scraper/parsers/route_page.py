@@ -7,7 +7,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
 
-from consorcio_fenix_scraper.domain import ItineraryStep, ParsedRoutePage, ScheduleEntry, ServiceDirection
+from consorcio_fenix_scraper.domain import FarePolicy, ItineraryStep, ParsedRoutePage, ScheduleEntry, ServiceDirection
 
 TIME_RE = re.compile(r"\b(\d{1,2}:\d{2})\b")
 FLAG_RE = re.compile(r"(?<!\w)([E*MR])(?!\w)")
@@ -19,7 +19,7 @@ def parse_route_page(html: str, page_url: str) -> ParsedRoutePage:
     slug, _ = _route_identity_from_url(page_url)
     map_url = _extract_map_url(soup, page_url)
     service_directions = _parse_service_directions(soup)
-    schedules = [entry for direction in service_directions for entry in direction.schedules]
+    fare_region = _first_labeled_value(soup, "Tarifa")
 
     return ParsedRoutePage(
         code=code,
@@ -27,9 +27,10 @@ def parse_route_page(html: str, page_url: str) -> ParsedRoutePage:
         slug=slug,
         page_url=page_url,
         map_url=map_url,
-        category=_find_labeled_value(soup, "Categoria"),
-        fare_cents=_parse_fare(_find_labeled_value(soup, "Tarifa")),
-        last_changed=_parse_brazilian_date(_find_labeled_value(soup, "Última alteração")),
+        category=_first_labeled_value(soup, "Característica", "Categoria"),
+        fare_region=fare_region,
+        fare_policy=_parse_fare_policy(soup, fare_region),
+        last_changed=_parse_brazilian_date(_first_labeled_value(soup, "Alterada em", "Última alteração")),
         service_directions=service_directions,
         schedules=_parse_schedules(soup),
         itinerary_steps=_parse_itinerary(soup),
@@ -83,6 +84,75 @@ def _find_labeled_value(soup: BeautifulSoup, label: str) -> str | None:
             if value:
                 return value
             sibling = sibling.find_next_sibling()
+    return None
+
+
+def _first_labeled_value(soup: BeautifulSoup, *labels: str) -> str | None:
+    for label in labels:
+        value = _find_labeled_value(soup, label)
+        if value:
+            return value
+    return None
+
+
+def _parse_fare_policy(soup: BeautifulSoup, region: str | None) -> FarePolicy | None:
+    if not region:
+        return None
+    citizen_card_cents = _parse_fare(_first_labeled_value(soup, "Cartão Cidadão", "Cartao Cidadao"))
+    vt_tourist_card_cents = _parse_fare(_first_labeled_value(soup, "Cartão VT/Turista", "Cartao VT/Turista"))
+    cash_qrcode_pix_cents = _parse_fare(
+        _first_labeled_value(
+            soup,
+            "Dinheiro/QRCODE/PIX",
+            "Dinheiro/QRCODE",
+            "Dinheiro/QRCode/PIX",
+            "Dinheiro/QRCode",
+        )
+    )
+    if citizen_card_cents is None or vt_tourist_card_cents is None or cash_qrcode_pix_cents is None:
+        banner_fares = _parse_conventional_fare_banner(soup)
+        citizen_card_cents = citizen_card_cents if citizen_card_cents is not None else banner_fares.get("citizen_card_cents")
+        vt_tourist_card_cents = (
+            vt_tourist_card_cents if vt_tourist_card_cents is not None else banner_fares.get("vt_tourist_card_cents")
+        )
+        cash_qrcode_pix_cents = (
+            cash_qrcode_pix_cents if cash_qrcode_pix_cents is not None else banner_fares.get("cash_qrcode_pix_cents")
+        )
+    if citizen_card_cents is None and vt_tourist_card_cents is None and cash_qrcode_pix_cents is None:
+        return None
+    return FarePolicy(
+        region=region,
+        citizen_card_cents=citizen_card_cents,
+        vt_tourist_card_cents=vt_tourist_card_cents,
+        cash_qrcode_pix_cents=cash_qrcode_pix_cents,
+    )
+
+
+def _parse_conventional_fare_banner(soup: BeautifulSoup) -> dict[str, int]:
+    fares: dict[str, int] = {}
+    banner = _fare_banner_text(soup)
+    if not banner:
+        return fares
+    conventional_text = re.split(r"\|\s*Tarifa\s+Executivo\b", banner, maxsplit=1, flags=re.IGNORECASE)[0]
+    cash_match = re.search(r"Dinheiro\s*/\s*QRCODE\s*/\s*PIX\s*R\$\s*(\d+(?:[,.]\d{2})?)", conventional_text, re.IGNORECASE)
+    citizen_match = re.search(r"\bCidad[aã]o\s*R\$\s*(\d+(?:[,.]\d{2})?)", conventional_text, re.IGNORECASE)
+    vt_tourist_match = re.search(r"\bVT\.?\s*e\s*Turista\s*R\$\s*(\d+(?:[,.]\d{2})?)", conventional_text, re.IGNORECASE)
+    if cash_match:
+        fares["cash_qrcode_pix_cents"] = _parse_fare(cash_match.group(1)) or 0
+    if citizen_match:
+        fares["citizen_card_cents"] = _parse_fare(citizen_match.group(1)) or 0
+    if vt_tourist_match:
+        fares["vt_tourist_card_cents"] = _parse_fare(vt_tourist_match.group(1)) or 0
+    return fares
+
+
+def _fare_banner_text(soup: BeautifulSoup) -> str | None:
+    banner = soup.find(id="tarifas")
+    if isinstance(banner, Tag):
+        return _text(banner)
+    for text in soup.stripped_strings:
+        if re.search(r"Tarifa\s+Convencional", text, re.IGNORECASE):
+            return text.strip()
     return None
 
 

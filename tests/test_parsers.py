@@ -19,7 +19,6 @@ def test_route_page_parser_extracts_metadata_schedules_flags_and_itinerary():
     assert route.name == "TICEN - TITRI via Mauro Ramos"
     assert route.slug == "ticen-titri-via-mauro-ramos"
     assert route.category == "Executivo"
-    assert route.fare_cents == 690
     assert route.last_changed.isoformat() == "2026-04-01"
     assert route.map_url == "https://www.consorciofenix.com.br/mapa/ticen-titri-via-mauro-ramos,110"
     assert [step.name for step in route.itinerary_steps] == [
@@ -85,12 +84,64 @@ def test_route_page_parser_handles_split_labels_captioned_schedules_and_kml_link
     )
 
     assert route.category == "Convencional"
-    assert route.fare_cents == 690
     assert route.map_url == "https://www.consorciofenix.com.br/arquivos/kml/ticen-titri-via-mauro-ramos,110.kml"
     assert [(entry.day_type, entry.departure_label, entry.time, entry.flags) for entry in route.schedules] == [
         ("Dias Úteis", "TICEN", "06:00", ("E",)),
         ("Dias Úteis", "TITRI", "06:30", ("*",)),
     ]
+
+
+def test_route_page_parser_extracts_live_route_metadata_and_fare_policy():
+    html = """
+    <html><body>
+      <h1>665 - Abraão</h1>
+      <div class="linha-info">
+        <span>Característica: Alimentadora TICEN</span>
+        <span>Tarifa: Região Única</span>
+        <span>Cartão Cidadão: R$ 6,20</span>
+        <span>Cartão VT/Turista: R$ 7,20</span>
+        <span>Dinheiro/QRCODE/PIX: R$ 7,70</span>
+        <span>Alterada em: 02/05/2026</span>
+      </div>
+    </body></html>
+    """
+
+    route = parse_route_page(html, page_url="https://www.consorciofenix.com.br/horarios/abraao,665")
+
+    assert route.category == "Alimentadora TICEN"
+    assert route.fare_region == "Região Única"
+    assert route.fare_policy is not None
+    assert route.fare_policy.region == "Região Única"
+    assert route.fare_policy.citizen_card_cents == 620
+    assert route.fare_policy.vt_tourist_card_cents == 720
+    assert route.fare_policy.cash_qrcode_pix_cents == 770
+    assert route.last_changed.isoformat() == "2026-05-02"
+
+
+def test_route_page_parser_extracts_fare_policy_from_live_combined_fare_banner():
+    html = """
+    <html><body>
+      <h1>665 - Abraão</h1>
+      <div class="mini-header" id="tarifas">
+        <span>
+          Tarifa Convencional: Dinheiro/QRCODE/PIX R$ 7,70 /
+          Cartões: Cidadão R$ 6,20 / VT. e Turista R$ 7,20 |
+          Tarifa Executivo: Cartão Passe Rápido/QRCODE/PIX R$ 20,00
+        </span>
+      </div>
+      <div class="linha-info">
+        <span>Tarifa: Região Única</span>
+      </div>
+    </body></html>
+    """
+
+    route = parse_route_page(html, page_url="https://www.consorciofenix.com.br/horarios/abraao,665")
+
+    assert route.fare_policy is not None
+    assert route.fare_policy.region == "Região Única"
+    assert route.fare_policy.citizen_card_cents == 620
+    assert route.fare_policy.vt_tourist_card_cents == 720
+    assert route.fare_policy.cash_qrcode_pix_cents == 770
 
 
 def test_route_page_parser_handles_live_schedule_cards_data_src_map_and_itinerary_list():

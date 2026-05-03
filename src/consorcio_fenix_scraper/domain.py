@@ -69,6 +69,13 @@ class ServiceDirectionMatch(BaseModel):
     notes: dict[str, str] = Field(default_factory=dict)
 
 
+class FarePolicy(BaseModel):
+    region: str
+    citizen_card_cents: int | None = None
+    vt_tourist_card_cents: int | None = None
+    cash_qrcode_pix_cents: int | None = None
+
+
 class ParsedRoutePage(BaseModel):
     code: str
     name: str
@@ -76,7 +83,8 @@ class ParsedRoutePage(BaseModel):
     page_url: str
     map_url: str | None = None
     category: str | None = None
-    fare_cents: int | None = None
+    fare_region: str | None = None
+    fare_policy: FarePolicy | None = None
     last_changed: date | None = None
     service_directions: list[ServiceDirection] = Field(default_factory=list)
     schedules: list[ScheduleEntry] = Field(default_factory=list)
