@@ -7,7 +7,7 @@ from hashlib import sha256
 from uuid import UUID as PyUUID, uuid4
 
 from geoalchemy2 import Geometry
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, Uuid, create_engine, select
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, Uuid, create_engine, select
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -21,6 +21,7 @@ from consorcio_fenix_scraper.domain import (
     ScrapeStatus,
 )
 from consorcio_fenix_scraper.logging import get_logger
+from consorcio_fenix_scraper.segments import materialize_route_segments
 
 
 logger = get_logger(__name__)
@@ -120,6 +121,37 @@ class RouteDirectionRecord(Base):
     name: Mapped[str] = mapped_column(Text)
     sequence: Mapped[int] = mapped_column(Integer)
     geometry: Mapped[object] = mapped_column(_geometry_type("LINESTRING"))
+
+
+class RouteSegmentRecord(Base):
+    __tablename__ = "route_segments"
+    __table_args__ = (
+        UniqueConstraint(
+            "route_version_id",
+            "route_direction_id",
+            "sequence",
+            name="uq_route_segments_route_version_direction_sequence",
+        ),
+        Index("ix_route_segments_geometry", "geometry", postgresql_using="gist"),
+        Index(
+            "ix_route_segments_route_version_direction_sequence",
+            "route_version_id",
+            "route_direction_id",
+            "sequence",
+        ),
+    )
+
+    id: Mapped[PyUUID] = _uuid_pk()
+    route_version_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("route_versions.id"), index=True)
+    route_direction_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("route_directions.id"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    source_segment_sequence: Mapped[int] = mapped_column(Integer)
+    source_fraction_start: Mapped[float] = mapped_column(Float)
+    source_fraction_end: Mapped[float] = mapped_column(Float)
+    geometry: Mapped[object] = mapped_column(_geometry_type("LINESTRING"))
+    bearing_degrees: Mapped[float] = mapped_column(Float)
+    distance_meters: Mapped[float] = mapped_column(Float)
+    cumulative_distance_meters: Mapped[float] = mapped_column(Float)
 
 
 class ServiceDirectionRecord(Base):
@@ -322,6 +354,7 @@ def _fare_policy_hash(fare_policy: FarePolicy) -> str:
 
 def _persist_children(session: Session, route_version_id: PyUUID, snapshot: RouteSnapshot) -> None:
     route_directions: list[RouteDirectionRecord] = []
+    direction_by_sequence: dict[int, RouteDirection] = {}
     for index, direction in enumerate(snapshot.directions, start=1):
         route_direction = RouteDirectionRecord(
             route_version_id=route_version_id,
@@ -331,7 +364,26 @@ def _persist_children(session: Session, route_version_id: PyUUID, snapshot: Rout
         )
         session.add(route_direction)
         route_directions.append(route_direction)
+        direction_by_sequence[index] = direction
     session.flush()
+
+    for route_direction in route_directions:
+        direction = direction_by_sequence[route_direction.sequence]
+        for segment in materialize_route_segments(direction):
+            session.add(
+                RouteSegmentRecord(
+                    route_version_id=route_version_id,
+                    route_direction_id=route_direction.id,
+                    sequence=segment.sequence,
+                    source_segment_sequence=segment.source_segment_sequence,
+                    source_fraction_start=segment.source_fraction_start,
+                    source_fraction_end=segment.source_fraction_end,
+                    geometry=_segment_linestring_wkt(segment.coordinates),
+                    bearing_degrees=segment.bearing_degrees,
+                    distance_meters=segment.distance_meters,
+                    cumulative_distance_meters=segment.cumulative_distance_meters,
+                )
+            )
 
     route_direction_by_sequence = {direction.sequence: direction.id for direction in route_directions}
     matches_by_service_sequence = {match.service_direction_sequence: match for match in snapshot.direction_matches}
@@ -378,6 +430,10 @@ def _persist_children(session: Session, route_version_id: PyUUID, snapshot: Rout
 
 def _linestring_wkt(direction: RouteDirection) -> str:
     return "SRID=4326;LINESTRING(" + ", ".join(f"{lon} {lat}" for lon, lat in direction.coordinates) + ")"
+
+
+def _segment_linestring_wkt(coordinates: list[tuple[float, float]]) -> str:
+    return "SRID=4326;LINESTRING(" + ", ".join(f"{lon} {lat}" for lon, lat in coordinates) + ")"
 
 
 def hash_text(text: str) -> str:

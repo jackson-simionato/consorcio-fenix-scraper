@@ -10,6 +10,7 @@ from consorcio_fenix_scraper.db import (
     Base,
     FareVersionRecord,
     RouteDirectionRecord,
+    RouteSegmentRecord,
     RouteRecord,
     RouteVersionRecord,
     ScheduleEntryRecord,
@@ -17,6 +18,7 @@ from consorcio_fenix_scraper.db import (
     ServiceDirectionRecord,
     _linestring_wkt,
     _persist_snapshot,
+    persist_snapshots,
 )
 from consorcio_fenix_scraper.domain import (
     DirectionMatchConfidence,
@@ -47,6 +49,7 @@ def db_session():
             RouteRecord.__table__,
             RouteVersionRecord.__table__,
             RouteDirectionRecord.__table__,
+            RouteSegmentRecord.__table__,
             ServiceDirectionRecord.__table__,
             ScheduleEntryRecord.__table__,
         ],
@@ -81,6 +84,15 @@ def _snapshot(
         source_hash=source_hash,
         map_hash=map_hash,
     )
+
+
+def _snapshot_with_directions(source_hash: str = "source-a", map_hash: str | None = "map-a") -> RouteSnapshot:
+    snapshot = _snapshot(source_hash=source_hash, map_hash=map_hash)
+    snapshot.directions = [
+        RouteDirection(name="Ida", coordinates=[(-48.548, -27.5969), (-48.547, -27.5969)]),
+        RouteDirection(name="Volta", coordinates=[(-48.547, -27.5969), (-48.548, -27.5969)]),
+    ]
+    return snapshot
 
 
 def test_uuid_pk_generates_uuid_values(db_session: Session):
@@ -131,6 +143,94 @@ def test_creates_new_route_version_when_map_hash_changes(db_session: Session):
     assert len(versions) == 2
     assert first.is_current is False
     assert second.is_current is True
+
+
+def test_persists_route_segments_for_new_route_versions(db_session: Session):
+    snapshot = _snapshot_with_directions()
+
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
+
+    version = db_session.query(RouteVersionRecord).one()
+    route_directions = db_session.query(RouteDirectionRecord).order_by(RouteDirectionRecord.sequence).all()
+    route_segments = db_session.query(RouteSegmentRecord).order_by(
+        RouteSegmentRecord.route_direction_id,
+        RouteSegmentRecord.sequence,
+    ).all()
+
+    assert len(route_segments) == 2
+    assert {segment.route_version_id for segment in route_segments} == {version.id}
+    assert {segment.route_direction_id for segment in route_segments} == {direction.id for direction in route_directions}
+    assert [segment.sequence for segment in route_segments] == [1, 1]
+    assert [segment.source_segment_sequence for segment in route_segments] == [1, 1]
+    assert [segment.source_fraction_start for segment in route_segments] == [0.0, 0.0]
+    assert [segment.source_fraction_end for segment in route_segments] == [1.0, 1.0]
+    assert all(segment.geometry.startswith("SRID=4326;LINESTRING(") for segment in route_segments)
+    assert all(segment.distance_meters > 0 for segment in route_segments)
+    assert all(segment.cumulative_distance_meters == segment.distance_meters for segment in route_segments)
+    assert all(0 <= segment.bearing_degrees < 360 for segment in route_segments)
+
+
+def test_reused_route_version_does_not_duplicate_route_segments(db_session: Session):
+    snapshot = _snapshot_with_directions()
+
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
+
+    assert db_session.query(RouteVersionRecord).count() == 1
+    assert db_session.query(RouteDirectionRecord).count() == 2
+    assert db_session.query(RouteSegmentRecord).count() == 2
+
+
+def test_changed_source_hash_creates_route_version_with_own_route_segments(db_session: Session):
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions(source_hash="source-a")])
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions(source_hash="source-b")])
+
+    versions = db_session.query(RouteVersionRecord).order_by(RouteVersionRecord.created_at).all()
+    route_segments = db_session.query(RouteSegmentRecord).all()
+
+    assert len(versions) == 2
+    assert len(route_segments) == 4
+    assert {segment.route_version_id for segment in route_segments} == {version.id for version in versions}
+
+
+def test_changed_map_hash_creates_route_version_with_own_route_segments(db_session: Session):
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions(map_hash="map-a")])
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions(map_hash="map-b")])
+
+    versions = db_session.query(RouteVersionRecord).order_by(RouteVersionRecord.created_at).all()
+    route_segments = db_session.query(RouteSegmentRecord).all()
+
+    assert len(versions) == 2
+    assert len(route_segments) == 4
+    assert {segment.route_version_id for segment in route_segments} == {version.id for version in versions}
+
+
+def test_route_segments_schema_supports_nearby_route_discovery():
+    table = RouteSegmentRecord.__table__
+    geometry_type = table.c.geometry.type._variant_mapping["postgresql"]
+    index_by_name = {index.name: index for index in table.indexes}
+
+    assert set(table.c) >= {
+        table.c.route_version_id,
+        table.c.route_direction_id,
+        table.c.sequence,
+        table.c.source_segment_sequence,
+        table.c.source_fraction_start,
+        table.c.source_fraction_end,
+        table.c.geometry,
+        table.c.bearing_degrees,
+        table.c.distance_meters,
+        table.c.cumulative_distance_meters,
+    }
+    assert geometry_type.geometry_type == "LINESTRING"
+    assert geometry_type.srid == 4326
+    assert index_by_name["ix_route_segments_geometry"].dialect_options["postgresql"]["using"] == "gist"
+    assert [column.name for column in index_by_name["ix_route_segments_geometry"].columns] == ["geometry"]
+    assert [column.name for column in index_by_name["ix_route_segments_route_version_direction_sequence"].columns] == [
+        "route_version_id",
+        "route_direction_id",
+        "sequence",
+    ]
 
 
 def test_persists_route_metadata_and_links_route_version_to_fare_version(db_session: Session):
