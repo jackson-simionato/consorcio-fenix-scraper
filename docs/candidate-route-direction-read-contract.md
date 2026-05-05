@@ -99,3 +99,61 @@ The advisory app should treat these fields as stable identifiers and display inp
 
 The advisory app may use `route_direction_id` and `route_version_id` to load ordered Materialized Route Segments for Projected Route Position and Upcoming Exposure Window calculations.
 Those follow-up reads must also filter to current routes and current route versions before trusting public Onboard Advisory output.
+
+## Onboard Advisory Readiness
+
+The scraper database provides the read model needed for first-version Onboard Advisory flows, while the advisory app owns passenger-facing calculations and presentation.
+Every public advisory read must continue to filter to current routes and current route versions before trusting the selected Route Direction:
+
+- `routes.is_current = true`
+- `route_versions.is_current = true`
+- `route_versions.route_id = routes.id`
+- `route_directions.route_version_id = route_versions.id`
+
+Projected Route Position is supported by ordered Materialized Route Segments for the selected Route Direction.
+The advisory app should load `route_segments` by `route_version_id` and `route_direction_id`, ordered by `route_segments.sequence`.
+The scraper-owned fields that support projection are:
+
+- `route_segments.geometry`, the directed segment geometry used for nearest-segment projection and segment proximity checks.
+- `route_segments.sequence`, the stable segment order within the Route Direction.
+- `route_segments.bearing_degrees`, the passenger-facing travel bearing for side-of-bus exposure calculations.
+- `route_segments.distance_meters`, the segment length.
+- `route_segments.cumulative_distance_meters`, the distance from the Route Direction start through the segment.
+- `route_segments.source_segment_sequence`, `route_segments.source_fraction_start`, and `route_segments.source_fraction_end`, the lineage back to source KML geometry when debugging projection or segmentation.
+
+Upcoming Exposure Window and Remaining Route Exposure are supported by the same ordered segment read.
+The advisory app can derive an Upcoming Exposure Window from the Projected Route Position through the configured near-term distance or time horizon, and can derive Remaining Route Exposure from the Projected Route Position through the final segment of the selected Route Direction.
+The scraper provides segment geometry, bearing, distance, and cumulative distance; the advisory app chooses the live windowing rule and aggregation.
+
+Sun Position and Sun Exposure are advisory-app responsibilities.
+The scraper does not precompute Sun Position, Sun Exposure, Sun-side Advisory output, segment timestamps, exposure windows, or passenger-facing side labels.
+The advisory app computes Sun Position and Sun Exposure live from the selected Materialized Route Segments, passenger location, request datetime, and its own astronomy/exposure rules.
+
+The default off-route threshold is 75 meters and belongs to the advisory app.
+It is applied after segment proximity/projection against `route_segments.geometry`; if the Projected Route Position is farther than 75 meters from the selected Route Direction, the advisory app should withhold the Onboard Advisory.
+The scraper only stores the segment geometries needed for that threshold check.
+
+First-version advisories are Geometric Sun Exposure only.
+They are not temperature, weather, shadow, seat-row, or fleet-specific cabin predictions.
+Weather data, shade models, vehicle layout, curtain state, and cabin thermal behavior are outside the scraper contract.
+
+Readiness checklist:
+
+- Projected Route Position is covered by ordered `route_segments.geometry`, `route_segments.sequence`, `route_segments.distance_meters`, and `route_segments.cumulative_distance_meters`.
+- Upcoming Exposure Window is covered by ordered segment reads after Projected Route Position; the advisory app owns the window horizon.
+- Remaining Route Exposure is covered by ordered segment reads from Projected Route Position to the end of the selected Route Direction.
+- Current route and current route version filtering is covered by `routes.is_current` and `route_versions.is_current`.
+- Candidate Route Direction eligibility is covered by Materialized Route Segment existence for a current Route Direction.
+- Candidate Direction Label fallback is covered by preferring `service_directions.departure_label` and falling back to `route_directions.name`.
+- Sun Position and Sun Exposure live computation is intentionally outside this scraper.
+
+## Future advisory-app work
+
+The remaining gaps are advisory-app work, not scraper obligations:
+
+- Choose the public Nearby Route Discovery radius and the exact Upcoming Exposure Window horizon.
+- Implement Projected Route Position snapping and enforce the default 75 meters off-route threshold.
+- Compute Sun Position and Geometric Sun Exposure live for the request datetime.
+- Convert segment-level exposure into passenger-facing Onboard Advisory copy.
+- Decide how to handle low GPS accuracy, stale browser location, and user-selected Candidate Route Direction mistakes.
+- Add optional future models for weather, shadows, seat rows, fleet-specific cabin layout, and thermal comfort if the product scope expands beyond Geometric Sun Exposure only.

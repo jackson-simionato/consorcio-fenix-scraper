@@ -19,3 +19,30 @@ def test_candidate_route_direction_read_contract_is_documented():
 
     for phrase in required_phrases:
         assert phrase in contract
+
+
+def test_onboard_advisory_readiness_is_documented():
+    contract = Path("docs/candidate-route-direction-read-contract.md").read_text(encoding="utf-8")
+
+    required_phrases = [
+        "Projected Route Position",
+        "route_segments.geometry",
+        "route_segments.bearing_degrees",
+        "route_segments.distance_meters",
+        "route_segments.cumulative_distance_meters",
+        "Upcoming Exposure Window",
+        "Remaining Route Exposure",
+        "Sun Position",
+        "Sun Exposure",
+        "does not precompute",
+        "75 meters",
+        "Geometric Sun Exposure only",
+        "temperature, weather, shadow, seat-row, or fleet-specific cabin predictions",
+        "current routes and current route versions",
+        "Candidate Route Direction eligibility",
+        "Candidate Direction Label fallback",
+        "Future advisory-app work",
+    ]
+
+    for phrase in required_phrases:
+        assert phrase in contract
