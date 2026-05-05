@@ -120,6 +120,11 @@ class ScrapeRunResult(BaseModel):
     failures: list[str] = Field(default_factory=list)
 
 
+class RouteSegmentRebuildResult(BaseModel):
+    route_directions: int = 0
+    segments_written: int = 0
+
+
 class ScrapeRun(BaseModel):
     id: UUID | None = None
     source_url: HttpUrl | str

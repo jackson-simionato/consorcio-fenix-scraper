@@ -7,7 +7,23 @@ from hashlib import sha256
 from uuid import UUID as PyUUID, uuid4
 
 from geoalchemy2 import Geometry
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, Uuid, create_engine, select
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    create_engine,
+    func,
+    select,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -17,6 +33,7 @@ from consorcio_fenix_scraper.domain import (
     FarePolicy,
     RouteDirection,
     RouteSnapshot,
+    RouteSegmentRebuildResult,
     ScrapeRunResult,
     ScrapeStatus,
 )
@@ -428,12 +445,68 @@ def _persist_children(session: Session, route_version_id: PyUUID, snapshot: Rout
         session.add(ItineraryStepRecord(route_version_id=route_version_id, sequence=step.sequence, name=step.name))
 
 
+def rebuild_route_segments(session: Session) -> RouteSegmentRebuildResult:
+    directions = _stored_route_directions(session)
+    session.query(RouteSegmentRecord).delete(synchronize_session=False)
+
+    result = RouteSegmentRebuildResult(route_directions=len(directions))
+    for route_version_id, route_direction_id, name, geometry in directions:
+        direction = RouteDirection(name=name, coordinates=_coordinates_from_linestring_wkt(geometry))
+        for segment in materialize_route_segments(direction):
+            session.add(
+                RouteSegmentRecord(
+                    route_version_id=route_version_id,
+                    route_direction_id=route_direction_id,
+                    sequence=segment.sequence,
+                    source_segment_sequence=segment.source_segment_sequence,
+                    source_fraction_start=segment.source_fraction_start,
+                    source_fraction_end=segment.source_fraction_end,
+                    geometry=_segment_linestring_wkt(segment.coordinates),
+                    bearing_degrees=segment.bearing_degrees,
+                    distance_meters=segment.distance_meters,
+                    cumulative_distance_meters=segment.cumulative_distance_meters,
+                )
+            )
+            result.segments_written += 1
+    return result
+
+
+def _stored_route_directions(session: Session) -> list[tuple[PyUUID, PyUUID, str, str]]:
+    statement = select(
+        RouteDirectionRecord.route_version_id,
+        RouteDirectionRecord.id,
+        RouteDirectionRecord.name,
+        (
+            func.ST_AsText(RouteDirectionRecord.geometry)
+            if session.get_bind().dialect.name == "postgresql"
+            else RouteDirectionRecord.geometry
+        ),
+    ).order_by(RouteDirectionRecord.route_version_id, RouteDirectionRecord.sequence)
+    return [
+        (route_version_id, route_direction_id, name, geometry)
+        for route_version_id, route_direction_id, name, geometry in session.execute(statement)
+    ]
+
+
 def _linestring_wkt(direction: RouteDirection) -> str:
     return "SRID=4326;LINESTRING(" + ", ".join(f"{lon} {lat}" for lon, lat in direction.coordinates) + ")"
 
 
 def _segment_linestring_wkt(coordinates: list[tuple[float, float]]) -> str:
     return "SRID=4326;LINESTRING(" + ", ".join(f"{lon} {lat}" for lon, lat in coordinates) + ")"
+
+
+def _coordinates_from_linestring_wkt(geometry: str) -> list[tuple[float, float]]:
+    wkt = geometry.split(";", 1)[-1].strip()
+    prefix = "LINESTRING("
+    if not wkt.upper().startswith(prefix) or not wkt.endswith(")"):
+        raise ValueError(f"unsupported route direction geometry: {geometry}")
+    coordinates_text = wkt[len(prefix) : -1]
+    coordinates: list[tuple[float, float]] = []
+    for coordinate_text in coordinates_text.split(","):
+        lon_text, lat_text = coordinate_text.strip().split()[:2]
+        coordinates.append((float(lon_text), float(lat_text)))
+    return coordinates
 
 
 def hash_text(text: str) -> str:

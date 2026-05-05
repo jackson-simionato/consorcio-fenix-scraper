@@ -2,10 +2,20 @@ import logging
 import asyncio
 from pathlib import Path
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 from typer.testing import CliRunner
 
 from consorcio_fenix_scraper import cli
 from consorcio_fenix_scraper.cli import app
+from consorcio_fenix_scraper.db import (
+    Base,
+    RouteDirectionRecord,
+    RouteSegmentRecord,
+    ScrapeRunRecord,
+    persist_snapshots,
+)
+from consorcio_fenix_scraper.domain import ParsedRoutePage, RouteDirection, RouteSnapshot
 
 
 def test_dry_run_cli_parses_fixture_pages_without_database_writes():
@@ -181,3 +191,81 @@ def test_live_cli_rejects_zero_concurrency_before_fetching():
     assert result.exit_code != 0
     assert isinstance(result.exception, ValueError)
     assert str(result.exception) == "concurrency must be greater than zero"
+
+
+def test_rebuild_route_segments_cli_rebuilds_from_stored_route_directions(tmp_path):
+    runner = CliRunner()
+    database_url = _sqlite_database_url(tmp_path)
+    session_factory = _prepared_session_factory(database_url)
+    with session_factory.begin() as session:
+        persist_snapshots(session, "https://example.test/horarios", [_snapshot_with_direction()])
+        session.query(RouteSegmentRecord).delete()
+
+    result = runner.invoke(app, ["rebuild-route-segments", "--database-url", database_url])
+
+    assert result.exit_code == 0
+    assert result.stdout.strip() == "route_directions=1 segments_written=5"
+    with session_factory() as session:
+        direction = session.query(RouteDirectionRecord).one()
+        segments = session.query(RouteSegmentRecord).order_by(RouteSegmentRecord.sequence).all()
+
+    assert len(segments) == 5
+    assert {segment.route_direction_id for segment in segments} == {direction.id}
+    assert segments[0].geometry.startswith("SRID=4326;LINESTRING(-48.0 -27.0, ")
+    assert segments[-1].geometry.endswith("-48.0 -27.01)")
+
+
+def test_rebuild_route_segments_cli_is_idempotent_and_does_not_rescrape(tmp_path, monkeypatch):
+    runner = CliRunner()
+    database_url = _sqlite_database_url(tmp_path)
+    session_factory = _prepared_session_factory(database_url)
+    with session_factory.begin() as session:
+        persist_snapshots(session, "https://example.test/horarios", [_snapshot_with_direction()])
+
+    async def fail_fetch(*_args, **_kwargs):
+        raise AssertionError("rebuild must not fetch route pages")
+
+    monkeypatch.setattr(cli, "_fetch_live_snapshots_async", fail_fetch)
+
+    first = runner.invoke(app, ["rebuild-route-segments", "--database-url", database_url])
+    second = runner.invoke(app, ["rebuild-route-segments", "--database-url", database_url])
+
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    assert first.stdout == second.stdout
+    with session_factory() as session:
+        assert session.query(ScrapeRunRecord).count() == 1
+        assert session.query(RouteSegmentRecord).count() == 5
+
+
+def _sqlite_database_url(tmp_path: Path) -> str:
+    return f"sqlite:///{tmp_path / 'routes.db'}"
+
+
+def _prepared_session_factory(database_url: str):
+    engine = create_engine(database_url, future=True)
+    Base.metadata.create_all(engine)
+    return sessionmaker(engine, expire_on_commit=False)
+
+
+def _snapshot_with_direction() -> RouteSnapshot:
+    return RouteSnapshot(
+        route=ParsedRoutePage(
+            code="110",
+            name="TICEN - TITRI",
+            slug="ticen-titri",
+            page_url="https://example.test/horarios/ticen-titri,110",
+            map_url="https://example.test/mapa/110",
+        ),
+        directions=[
+            RouteDirection(
+                name="Ida",
+                coordinates=[
+                    (-48.0, -27.0),
+                    (-48.0, -27.01),
+                ],
+            ),
+        ],
+        source_hash="source-a",
+        map_hash="map-a",
+    )

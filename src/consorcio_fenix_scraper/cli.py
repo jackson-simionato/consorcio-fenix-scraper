@@ -7,8 +7,13 @@ from typing import Annotated
 import typer
 
 from consorcio_fenix_scraper.config import load_config
-from consorcio_fenix_scraper.db import hash_text, make_session_factory, persist_snapshots
-from consorcio_fenix_scraper.domain import RouteSnapshot, ScrapeRunResult
+from consorcio_fenix_scraper.db import (
+    hash_text,
+    make_session_factory,
+    persist_snapshots,
+    rebuild_route_segments as rebuild_stored_route_segments,
+)
+from consorcio_fenix_scraper.domain import RouteSegmentRebuildResult, RouteSnapshot, ScrapeRunResult
 from consorcio_fenix_scraper.directions import infer_service_direction_matches
 from consorcio_fenix_scraper.http import AsyncHttpFetcher, limited, parse_route_links
 from consorcio_fenix_scraper.logging import configure_logging, get_logger
@@ -81,6 +86,25 @@ def scrape_routes(
 
     logger.info("Completed route scrape: %s", _format_result(result))
     typer.echo(_format_result(result))
+
+
+@app.command()
+def rebuild_route_segments(
+    database_url: Annotated[str | None, typer.Option("--database-url", envvar="DATABASE_URL")] = None,
+) -> None:
+    config = load_config()
+    database_url = database_url or config.database_url
+    configure_logging()
+    if not database_url:
+        raise typer.BadParameter("DATABASE_URL must not be empty")
+
+    logger.info("Starting route segment rebuild")
+    session_factory = make_session_factory(database_url)
+    with session_factory.begin() as session:
+        result = rebuild_stored_route_segments(session)
+
+    logger.info("Completed route segment rebuild: %s", _format_rebuild_result(result))
+    typer.echo(_format_rebuild_result(result))
 
 
 def _load_fixture_snapshots(route_html: Path | None, map_html: Path | None) -> list[RouteSnapshot]:
@@ -199,3 +223,7 @@ def _format_result(result: ScrapeRunResult) -> str:
         f"failures={len(result.failures)}",
     ]
     return " ".join(fields)
+
+
+def _format_rebuild_result(result: RouteSegmentRebuildResult) -> str:
+    return f"route_directions={result.route_directions} segments_written={result.segments_written}"
