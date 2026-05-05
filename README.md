@@ -63,3 +63,7 @@ Override it with `DATABASE_URL=...` when targeting another database.
 ## Scope
 
 Consórcio Fênix pages are treated as canonical for route metadata, schedules, textual itineraries, and KML shapes. Stop coordinate enrichment is isolated behind a Floripa no Ponto adapter boundary and currently reports unavailable instead of failing route ingestion.
+
+## Read Contracts
+
+- [Candidate Route Direction Read Contract](docs/candidate-route-direction-read-contract.md)
