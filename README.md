@@ -59,6 +59,13 @@ make scrape LIMIT=3
 
 The default `DATABASE_URL` points at the PostGIS service from `docker-compose.yml`.
 Override it with `DATABASE_URL=...` when targeting another database.
+You can also create a local `.env` file:
+
+```env
+DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/DATABASE
+```
+
+Environment variables still take precedence over values from `.env`.
 
 ## Scope
 
