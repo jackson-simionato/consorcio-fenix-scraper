@@ -23,7 +23,7 @@ from consorcio_fenix_scraper.db import (
     _postgresql_fare_version_upsert,
     _postgresql_route_upsert,
     _postgresql_route_version_insert,
-    persist_snapshots,
+    _persist_data_batch,
 )
 from consorcio_fenix_scraper.domain import (
     DirectionMatchConfidence,
@@ -96,6 +96,13 @@ def _snapshot(
     )
 
 
+def _persist_batch_for_test(session: Session, source_url: str, snapshots: list[RouteSnapshot]):
+    run = ScrapeRunRecord(source_url=source_url)
+    session.add(run)
+    session.flush()
+    return _persist_data_batch(session, run.id, snapshots)
+
+
 def test_persist_snapshots_batches_metadata_lookups_across_routes(db_session: Session):
     select_statements: list[str] = []
 
@@ -106,7 +113,7 @@ def test_persist_snapshots_batches_metadata_lookups_across_routes(db_session: Se
     engine = db_session.get_bind()
     event.listen(engine, "before_cursor_execute", record_selects)
     try:
-        persist_snapshots(
+        _persist_batch_for_test(
             db_session,
             "https://www.consorciofenix.com.br/horarios",
             [
@@ -218,14 +225,14 @@ def test_postgresql_child_bulk_statements_preserve_geometry_and_json_conversions
 
 def test_unchanged_batch_reuses_canonical_stored_ids_and_updates_route_metadata(db_session: Session):
     first_snapshot = _snapshot()
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [first_snapshot])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [first_snapshot])
     stored_route = db_session.query(RouteRecord).one()
     stored_fare = db_session.query(FareVersionRecord).one()
     stored_version = db_session.query(RouteVersionRecord).one()
 
     unchanged_snapshot = _snapshot()
     unchanged_snapshot.route.name = "Updated route name"
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [unchanged_snapshot])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [unchanged_snapshot])
 
     route = db_session.query(RouteRecord).one()
     fare = db_session.query(FareVersionRecord).one()
@@ -312,7 +319,7 @@ def test_persists_each_child_table_with_one_bulk_statement(db_session: Session):
     engine = db_session.get_bind()
     event.listen(engine, "before_cursor_execute", record_child_inserts)
     try:
-        persist_snapshots(
+        _persist_batch_for_test(
             db_session,
             "https://www.consorciofenix.com.br/horarios",
             [
@@ -336,9 +343,9 @@ def test_uuid_pk_generates_uuid_values(db_session: Session):
 
 
 def test_reuses_existing_route_version_when_source_and_map_hash_match(db_session: Session):
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot()])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot()])
     first_id = db_session.query(RouteVersionRecord).one().id
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot()])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot()])
 
     versions = db_session.query(RouteVersionRecord).all()
 
@@ -348,8 +355,8 @@ def test_reuses_existing_route_version_when_source_and_map_hash_match(db_session
 
 
 def test_creates_new_route_version_when_source_hash_changes(db_session: Session):
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(source_hash="source-a")])
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(source_hash="source-b")])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(source_hash="source-a")])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(source_hash="source-b")])
 
     versions = db_session.query(RouteVersionRecord).order_by(RouteVersionRecord.source_hash).all()
 
@@ -360,8 +367,8 @@ def test_creates_new_route_version_when_source_hash_changes(db_session: Session)
 
 
 def test_creates_new_route_version_when_map_hash_changes(db_session: Session):
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(map_hash="map-a")])
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(map_hash="map-b")])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(map_hash="map-a")])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(map_hash="map-b")])
 
     versions = db_session.query(RouteVersionRecord).order_by(RouteVersionRecord.map_hash).all()
 
@@ -374,7 +381,7 @@ def test_creates_new_route_version_when_map_hash_changes(db_session: Session):
 def test_persists_route_segments_for_new_route_versions(db_session: Session):
     snapshot = _snapshot_with_directions()
 
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
 
     version = db_session.query(RouteVersionRecord).one()
     route_directions = db_session.query(RouteDirectionRecord).order_by(RouteDirectionRecord.sequence).all()
@@ -399,8 +406,8 @@ def test_persists_route_segments_for_new_route_versions(db_session: Session):
 def test_reused_route_version_does_not_duplicate_route_segments(db_session: Session):
     snapshot = _snapshot_with_directions(map_hash=None)
 
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
 
     assert db_session.query(RouteVersionRecord).count() == 1
     assert db_session.query(RouteDirectionRecord).count() == 2
@@ -413,7 +420,7 @@ def test_reused_route_version_does_not_duplicate_route_segments(db_session: Sess
 def test_duplicate_snapshot_in_one_batch_does_not_duplicate_children(db_session: Session):
     snapshot = _snapshot_with_directions(map_hash=None)
 
-    persist_snapshots(
+    _persist_batch_for_test(
         db_session,
         "https://www.consorciofenix.com.br/horarios",
         [snapshot, snapshot],
@@ -428,8 +435,8 @@ def test_duplicate_snapshot_in_one_batch_does_not_duplicate_children(db_session:
 
 
 def test_changed_source_hash_creates_route_version_with_own_route_segments(db_session: Session):
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions(source_hash="source-a")])
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions(source_hash="source-b")])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions(source_hash="source-a")])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions(source_hash="source-b")])
 
     versions = db_session.query(RouteVersionRecord).order_by(RouteVersionRecord.created_at).all()
     route_segments = db_session.query(RouteSegmentRecord).all()
@@ -440,8 +447,8 @@ def test_changed_source_hash_creates_route_version_with_own_route_segments(db_se
 
 
 def test_changed_map_hash_creates_route_version_with_own_route_segments(db_session: Session):
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions(map_hash="map-a")])
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions(map_hash="map-b")])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions(map_hash="map-a")])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions(map_hash="map-b")])
 
     versions = db_session.query(RouteVersionRecord).order_by(RouteVersionRecord.created_at).all()
     route_segments = db_session.query(RouteSegmentRecord).all()
@@ -480,7 +487,7 @@ def test_route_segments_schema_supports_nearby_route_discovery():
 
 
 def test_persists_route_metadata_and_links_route_version_to_fare_version(db_session: Session):
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot()])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot()])
 
     route = db_session.query(RouteRecord).one()
     fare_version = db_session.query(FareVersionRecord).one()
@@ -500,8 +507,8 @@ def test_persists_route_metadata_and_links_route_version_to_fare_version(db_sess
 
 
 def test_reuses_existing_fare_version_for_same_policy_when_route_source_hash_changes(db_session: Session):
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(source_hash="source-a")])
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(source_hash="source-b")])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(source_hash="source-a")])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(source_hash="source-b")])
 
     fare_versions = db_session.query(FareVersionRecord).all()
 
@@ -509,12 +516,12 @@ def test_reuses_existing_fare_version_for_same_policy_when_route_source_hash_cha
 
 
 def test_marks_previous_fare_version_non_current_when_fare_policy_changes(db_session: Session):
-    persist_snapshots(
+    _persist_batch_for_test(
         db_session,
         "https://www.consorciofenix.com.br/horarios",
         [_snapshot(source_hash="source-a")],
     )
-    persist_snapshots(
+    _persist_batch_for_test(
         db_session,
         "https://www.consorciofenix.com.br/horarios",
         [_snapshot(source_hash="source-b", cash_qrcode_pix_cents=790)],
@@ -601,7 +608,7 @@ def test_persists_service_directions_and_links_schedules_through_matches(db_sess
         map_hash="map-a",
     )
 
-    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
 
     route_directions = db_session.query(RouteDirectionRecord).order_by(RouteDirectionRecord.sequence).all()
     service_directions = db_session.query(ServiceDirectionRecord).order_by(ServiceDirectionRecord.sequence).all()

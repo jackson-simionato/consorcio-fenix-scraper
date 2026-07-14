@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from time import perf_counter
 from typing import Annotated
 
 import typer
@@ -36,6 +37,10 @@ def scrape_routes(
     dry_run: Annotated[bool, typer.Option(help="Parse and report counts without database writes.")] = False,
     limit: Annotated[int | None, typer.Option(help="Limit route count for smoke runs.")] = None,
     concurrency: Annotated[int | None, typer.Option(help="Concurrent live route fetches.")] = None,
+    db_batch_rows: Annotated[
+        int | None,
+        typer.Option("--db-batch-rows", help="Maximum proposed database rows per transaction."),
+    ] = None,
     source_url: Annotated[
         str | None,
         typer.Option(help="Route index URL to discover /horarios links."),
@@ -53,6 +58,9 @@ def scrape_routes(
     database_url = database_url or config.database_url
     source_url = source_url or config.route_index_url
     concurrency = config.http_concurrency if concurrency is None else concurrency
+    db_batch_rows = config.db_batch_rows if db_batch_rows is None else db_batch_rows
+    if db_batch_rows < 1:
+        raise typer.BadParameter("must be greater than zero", param_hint="--db-batch-rows")
     configure_logging()
     logger.info("Starting route scrape")
     logger.info("Source URL: %s", source_url)
@@ -64,10 +72,18 @@ def scrape_routes(
     else:
         logger.info("Running in database write mode")
 
+    fetch_started = perf_counter()
     snapshots = (
         _load_fixture_snapshots(route_html, map_html)
         if route_html
         else asyncio.run(_fetch_live_snapshots_async(source_url, limit, concurrency))
+    )
+    fetch_duration = perf_counter() - fetch_started
+    logger.info(
+        "fetch_complete routes=%s duration_seconds=%.3f routes_per_second=%.2f",
+        len(snapshots),
+        fetch_duration,
+        len(snapshots) / fetch_duration if fetch_duration > 0 else 0.0,
     )
     result = _summarize_snapshots(snapshots)
 
@@ -79,10 +95,9 @@ def scrape_routes(
         if not database_url:
             raise typer.BadParameter("DATABASE_URL must not be empty unless --dry-run is set")
         session_factory = make_session_factory(database_url)
-        with session_factory.begin() as session:
-            result = persist_snapshots(session, source_url, snapshots)
-            if stop_result.status != "success":
-                result.warnings.append(f"stop_adapter={stop_result.status}: {stop_result.message}")
+        result = persist_snapshots(session_factory, source_url, snapshots, max_batch_rows=db_batch_rows)
+        if stop_result.status != "success":
+            result.warnings.append(f"stop_adapter={stop_result.status}: {stop_result.message}")
 
     logger.info("Completed route scrape: %s", _format_result(result))
     typer.echo(_format_result(result))

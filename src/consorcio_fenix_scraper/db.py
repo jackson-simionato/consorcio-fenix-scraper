@@ -4,6 +4,7 @@ import json
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
 from hashlib import sha256
+from time import perf_counter
 from typing import NamedTuple
 from uuid import UUID as PyUUID, uuid4
 
@@ -251,44 +252,184 @@ def make_session_factory(database_url: str) -> sessionmaker[Session]:
     return sessionmaker(make_engine(database_url), expire_on_commit=False)
 
 
-def persist_snapshots(session: Session, source_url: str, snapshots: Iterable[RouteSnapshot]) -> ScrapeRunResult:
-    snapshots = list(snapshots)
-    run = ScrapeRunRecord(source_url=source_url, status=ScrapeStatus.RUNNING.value)
-    session.add(run)
-    session.flush()
-    logger.info("Created scrape run id=%s source_url=%s", run.id, source_url)
+def persist_snapshots(
+    session_factory: sessionmaker[Session],
+    source_url: str,
+    snapshots: Iterable[RouteSnapshot],
+    *,
+    max_batch_rows: int = 10_000,
+) -> ScrapeRunResult:
+    if max_batch_rows < 1:
+        raise ValueError("max_batch_rows must be greater than zero")
 
+    started = perf_counter()
+    run_id = _create_scrape_run(session_factory, source_url)
     result = ScrapeRunResult()
+
     try:
-        reconciled_versions = _persist_snapshot_batch(session, run.id, snapshots)
-        new_versions: list[tuple[PyUUID, RouteSnapshot]] = []
-        for snapshot, (version, created) in zip(snapshots, reconciled_versions, strict=True):
-            result.routes += 1
-            result.schedules += len(snapshot.route.schedules)
-            result.geometries += len(snapshot.directions)
-            result.itinerary_steps += len(snapshot.route.itinerary_steps)
-            if created:
-                new_versions.append((version.id, snapshot))
-            logger.info("Persisted route %s version id=%s", snapshot.route.code, version.id)
-            logger.debug(
-                "Persisted route %s counts: schedules=%s directions=%s itinerary_steps=%s source_hash=%s map_hash=%s",
-                snapshot.route.code,
-                len(snapshot.route.schedules),
-                len(snapshot.directions),
-                len(snapshot.route.itinerary_steps),
-                snapshot.source_hash,
-                snapshot.map_hash,
+        snapshots = list(snapshots)
+        weighted_snapshots = [(snapshot, _snapshot_row_count(snapshot)) for snapshot in snapshots]
+        proposed_rows = sum(row_count for _, row_count in weighted_snapshots)
+        for batch_number, (batch, batch_rows) in enumerate(
+            _batch_weighted_snapshots(weighted_snapshots, max_batch_rows),
+            start=1,
+        ):
+            batch_started = perf_counter()
+            try:
+                with session_factory.begin() as session:
+                    batch_result = _persist_data_batch(session, run_id, batch)
+            except Exception:
+                batch_duration = perf_counter() - batch_started
+                logger.exception(
+                    "persistence_batch_failed scrape_run_id=%s batch=%s routes=%s proposed_rows=%s "
+                    "duration_seconds=%.3f rows_per_second=%.2f",
+                    run_id,
+                    batch_number,
+                    len(batch),
+                    batch_rows,
+                    batch_duration,
+                    _throughput(batch_rows, batch_duration),
+                )
+                raise
+            batch_duration = perf_counter() - batch_started
+            _add_result(result, batch_result)
+            logger.info(
+                "persistence_batch_complete scrape_run_id=%s batch=%s routes=%s proposed_rows=%s "
+                "duration_seconds=%.3f rows_per_second=%.2f",
+                run_id,
+                batch_number,
+                len(batch),
+                batch_rows,
+                batch_duration,
+                _throughput(batch_rows, batch_duration),
             )
-        _persist_children(session, new_versions)
-        run.status = ScrapeStatus.SUCCESS.value
-        logger.info("Finished scrape run id=%s status=%s routes=%s", run.id, run.status, result.routes)
+        _finish_scrape_run(session_factory, run_id, ScrapeStatus.SUCCESS)
     except Exception as exc:
-        run.status = ScrapeStatus.FAILED.value
-        run.error_summary = str(exc)
-        logger.exception("Scrape run id=%s failed: %s", run.id, exc)
+        try:
+            _finish_scrape_run(session_factory, run_id, ScrapeStatus.FAILED, error_summary=str(exc))
+        except Exception:
+            logger.exception("Could not durably finalize failed scrape run id=%s", run_id)
+        logger.exception("Scrape run id=%s failed: %s", run_id, exc)
         raise
-    finally:
+
+    duration = perf_counter() - started
+    logger.info(
+        "persistence_complete scrape_run_id=%s status=%s routes=%s proposed_rows=%s "
+        "duration_seconds=%.3f rows_per_second=%.2f",
+        run_id,
+        ScrapeStatus.SUCCESS.value,
+        result.routes,
+        proposed_rows,
+        duration,
+        _throughput(proposed_rows, duration),
+    )
+    return result
+
+
+def _create_scrape_run(session_factory: sessionmaker[Session], source_url: str) -> PyUUID:
+    with session_factory.begin() as session:
+        run = ScrapeRunRecord(source_url=source_url, status=ScrapeStatus.RUNNING.value)
+        session.add(run)
+        session.flush()
+        run_id = run.id
+    logger.info("Created scrape run id=%s source_url=%s", run_id, source_url)
+    return run_id
+
+
+def _finish_scrape_run(
+    session_factory: sessionmaker[Session],
+    run_id: PyUUID,
+    status: ScrapeStatus,
+    *,
+    error_summary: str | None = None,
+) -> None:
+    with session_factory.begin() as session:
+        run = session.get(ScrapeRunRecord, run_id)
+        if run is None:
+            raise RuntimeError(f"Scrape run id={run_id} no longer exists")
+        run.status = status.value
+        run.error_summary = error_summary
         run.finished_at = datetime.now(UTC)
+
+
+def _snapshot_row_count(snapshot: RouteSnapshot) -> int:
+    metadata_rows = 2 + int(snapshot.route.fare_policy is not None)
+    child_rows = (
+        len(snapshot.directions)
+        + sum(len(materialize_route_segments(direction)) for direction in snapshot.directions)
+        + len(snapshot.route.service_directions)
+        + sum(len(service.schedules) for service in snapshot.route.service_directions)
+        + len(snapshot.route.itinerary_steps)
+    )
+    return metadata_rows + child_rows
+
+
+def _batch_snapshots(snapshots: list[RouteSnapshot], max_rows: int) -> Iterable[list[RouteSnapshot]]:
+    weighted_snapshots = [(snapshot, _snapshot_row_count(snapshot)) for snapshot in snapshots]
+    for batch, _ in _batch_weighted_snapshots(weighted_snapshots, max_rows):
+        yield batch
+
+
+def _batch_weighted_snapshots(
+    weighted_snapshots: list[tuple[RouteSnapshot, int]],
+    max_rows: int,
+) -> Iterable[tuple[list[RouteSnapshot], int]]:
+    if max_rows < 1:
+        raise ValueError("max_rows must be greater than zero")
+
+    batch: list[RouteSnapshot] = []
+    batch_rows = 0
+    for snapshot, snapshot_rows in weighted_snapshots:
+        if batch and batch_rows + snapshot_rows > max_rows:
+            yield batch, batch_rows
+            batch = []
+            batch_rows = 0
+        batch.append(snapshot)
+        batch_rows += snapshot_rows
+        if snapshot_rows > max_rows:
+            yield batch, batch_rows
+            batch = []
+            batch_rows = 0
+    if batch:
+        yield batch, batch_rows
+
+
+def _throughput(row_count: int, duration: float) -> float:
+    return row_count / duration if duration > 0 else 0.0
+
+
+def _add_result(target: ScrapeRunResult, increment: ScrapeRunResult) -> None:
+    target.routes += increment.routes
+    target.schedules += increment.schedules
+    target.geometries += increment.geometries
+    target.itinerary_steps += increment.itinerary_steps
+    target.stops += increment.stops
+    target.warnings.extend(increment.warnings)
+    target.failures.extend(increment.failures)
+
+
+def _persist_data_batch(session: Session, run_id: PyUUID, snapshots: list[RouteSnapshot]) -> ScrapeRunResult:
+    result = ScrapeRunResult()
+    reconciled_versions = _persist_snapshot_batch(session, run_id, snapshots)
+    new_versions: list[tuple[PyUUID, RouteSnapshot]] = []
+    for snapshot, (version, created) in zip(snapshots, reconciled_versions, strict=True):
+        result.routes += 1
+        result.schedules += len(snapshot.route.schedules)
+        result.geometries += len(snapshot.directions)
+        result.itinerary_steps += len(snapshot.route.itinerary_steps)
+        if created:
+            new_versions.append((version.id, snapshot))
+        logger.info("Persisted route %s version id=%s", snapshot.route.code, version.id)
+        logger.debug(
+            "Persisted route %s counts: schedules=%s directions=%s itinerary_steps=%s source_hash=%s map_hash=%s",
+            snapshot.route.code,
+            len(snapshot.route.schedules),
+            len(snapshot.directions),
+            len(snapshot.route.itinerary_steps),
+            snapshot.source_hash,
+            snapshot.map_hash,
+        )
+    _persist_children(session, new_versions)
     return result
 
 

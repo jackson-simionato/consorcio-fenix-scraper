@@ -13,7 +13,7 @@ from consorcio_fenix_scraper.db import (
     RouteDirectionRecord,
     RouteSegmentRecord,
     ScrapeRunRecord,
-    persist_snapshots,
+    _persist_data_batch,
 )
 from consorcio_fenix_scraper.domain import ParsedRoutePage, RouteDirection, RouteSnapshot
 
@@ -67,7 +67,41 @@ def test_dry_run_cli_emits_lifecycle_logs_without_changing_summary(monkeypatch, 
         "Parsed fixture route code=110 schedules=5 service_directions=2 directions=2 direction_matches=2"
         in caplog.text
     )
+    assert "fetch_complete routes=1 duration_seconds=" in caplog.text
+    assert "routes_per_second=" in caplog.text
     assert "Completed route scrape: routes=1 schedules=5 geometries=2 itinerary_steps=3 stops=0 warnings=1 failures=0" in caplog.text
+
+
+def test_database_batch_rows_override_reaches_persistence_without_changing_stdout(monkeypatch):
+    runner = CliRunner()
+    fixture_dir = Path(__file__).parent / "fixtures"
+    captured: dict[str, int] = {}
+
+    def fake_persist(_session_factory, _source_url, snapshots, *, max_batch_rows):
+        captured["max_batch_rows"] = max_batch_rows
+        return cli._summarize_snapshots(snapshots)
+
+    monkeypatch.setattr(cli, "make_session_factory", lambda _url: object())
+    monkeypatch.setattr(cli, "persist_snapshots", fake_persist)
+
+    result = runner.invoke(
+        app,
+        [
+            "scrape-routes",
+            "--database-url",
+            "sqlite://",
+            "--db-batch-rows",
+            "1234",
+            "--route-html",
+            str(fixture_dir / "route_page.html"),
+            "--map-html",
+            str(fixture_dir / "map_page.html"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {"max_batch_rows": 1234}
+    assert result.stdout.strip() == "routes=1 schedules=5 geometries=2 itinerary_steps=3 stops=0 warnings=1 failures=0"
 
 
 def test_live_snapshot_fetching_respects_concurrency_and_preserves_route_order(monkeypatch):
@@ -198,7 +232,10 @@ def test_rebuild_route_segments_cli_rebuilds_from_stored_route_directions(tmp_pa
     database_url = _sqlite_database_url(tmp_path)
     session_factory = _prepared_session_factory(database_url)
     with session_factory.begin() as session:
-        persist_snapshots(session, "https://example.test/horarios", [_snapshot_with_direction()])
+        run = ScrapeRunRecord(source_url="https://example.test/horarios")
+        session.add(run)
+        session.flush()
+        _persist_data_batch(session, run.id, [_snapshot_with_direction()])
         session.query(RouteSegmentRecord).delete()
 
     result = runner.invoke(app, ["rebuild-route-segments", "--database-url", database_url])
@@ -220,7 +257,10 @@ def test_rebuild_route_segments_cli_is_idempotent_and_does_not_rescrape(tmp_path
     database_url = _sqlite_database_url(tmp_path)
     session_factory = _prepared_session_factory(database_url)
     with session_factory.begin() as session:
-        persist_snapshots(session, "https://example.test/horarios", [_snapshot_with_direction()])
+        run = ScrapeRunRecord(source_url="https://example.test/horarios")
+        session.add(run)
+        session.flush()
+        _persist_data_batch(session, run.id, [_snapshot_with_direction()])
 
     async def fail_fetch(*_args, **_kwargs):
         raise AssertionError("rebuild must not fetch route pages")

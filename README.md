@@ -51,6 +51,9 @@ uv run consorcio-fenix scrape-routes --limit 10 --concurrency 4
 CONSORCIO_FENIX_HTTP_CONCURRENCY=4 uv run consorcio-fenix scrape-routes --limit 10
 ```
 
+Database writes use sequential transactions capped at 10,000 proposed rows by default. Override the ceiling with
+`--db-batch-rows` or `CONSORCIO_FENIX_DB_BATCH_ROWS`; a single oversized route always runs in its own transaction.
+
 Or:
 
 ```bash

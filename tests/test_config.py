@@ -16,6 +16,7 @@ def test_project_config_defaults_match_local_docker_workflow(monkeypatch):
     assert config.http_retries == 2
     assert config.http_rate_limit_seconds == 0.5
     assert config.http_concurrency == 4
+    assert config.db_batch_rows == 10_000
 
 
 def test_project_config_reads_environment_overrides(monkeypatch):
@@ -24,6 +25,7 @@ def test_project_config_reads_environment_overrides(monkeypatch):
     monkeypatch.setenv("CONSORCIO_FENIX_BASE_URL", "https://example.test")
     monkeypatch.setenv("CONSORCIO_FENIX_HTTP_RETRIES", "5")
     monkeypatch.setenv("CONSORCIO_FENIX_HTTP_CONCURRENCY", "7")
+    monkeypatch.setenv("CONSORCIO_FENIX_DB_BATCH_ROWS", "1234")
 
     config = ProjectConfig(_env_file=None)
 
@@ -33,6 +35,7 @@ def test_project_config_reads_environment_overrides(monkeypatch):
     assert config.route_index_url == "https://example.test/horarios"
     assert config.http_retries == 5
     assert config.http_concurrency == 7
+    assert config.db_batch_rows == 1234
 
 
 def test_project_config_reads_database_url_from_dotenv(tmp_path, monkeypatch):

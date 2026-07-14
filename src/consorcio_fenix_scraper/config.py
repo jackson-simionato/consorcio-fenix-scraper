@@ -22,6 +22,7 @@ class ProjectConfig(BaseSettings):
     http_retries: int = Field(default=2, validation_alias="CONSORCIO_FENIX_HTTP_RETRIES")
     http_rate_limit_seconds: float = Field(default=0.5, validation_alias="CONSORCIO_FENIX_HTTP_RATE_LIMIT_SECONDS")
     http_concurrency: int = Field(default=4, validation_alias="CONSORCIO_FENIX_HTTP_CONCURRENCY")
+    db_batch_rows: int = Field(default=10_000, gt=0, validation_alias="CONSORCIO_FENIX_DB_BATCH_ROWS")
 
     @cached_property
     def route_index_url(self) -> str:
