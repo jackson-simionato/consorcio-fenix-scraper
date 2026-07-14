@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 from consorcio_fenix_scraper.db import (
     Base,
     FareVersionRecord,
+    ItineraryStepRecord,
     RouteDirectionRecord,
     RouteSegmentRecord,
     RouteRecord,
@@ -17,6 +18,7 @@ from consorcio_fenix_scraper.db import (
     ScheduleEntryRecord,
     ScrapeRunRecord,
     ServiceDirectionRecord,
+    _bulk_insert_statement,
     _linestring_wkt,
     _postgresql_fare_version_upsert,
     _postgresql_route_upsert,
@@ -27,6 +29,7 @@ from consorcio_fenix_scraper.domain import (
     DirectionMatchConfidence,
     DirectionMatchMethod,
     FarePolicy,
+    ItineraryStep,
     ParsedRoutePage,
     RouteDirection,
     RouteSnapshot,
@@ -55,6 +58,7 @@ def db_session():
             RouteSegmentRecord.__table__,
             ServiceDirectionRecord.__table__,
             ScheduleEntryRecord.__table__,
+            ItineraryStepRecord.__table__,
         ],
     )
     session_factory = sessionmaker(engine, expire_on_commit=False)
@@ -186,6 +190,32 @@ def test_postgresql_reconciliation_statements_return_canonical_identities():
     assert "RETURNING route_versions.route_id, route_versions.source_hash, route_versions.map_hash" in route_version_sql
 
 
+def test_postgresql_child_bulk_statements_preserve_geometry_and_json_conversions():
+    dialect = postgresql.dialect()
+
+    route_direction_sql = str(
+        _bulk_insert_statement(RouteDirectionRecord)
+        .values([{"geometry": "SRID=4326;LINESTRING(0 0, 1 1)"}])
+        .compile(dialect=dialect)
+    )
+    route_segment_sql = str(
+        _bulk_insert_statement(RouteSegmentRecord)
+        .values([{"geometry": "SRID=4326;LINESTRING(0 0, 1 1)"}])
+        .compile(dialect=dialect)
+    )
+    service_direction_sql = str(
+        _bulk_insert_statement(ServiceDirectionRecord).values([{"notes": {"departure_label": "TICEN"}}]).compile(dialect=dialect)
+    )
+    schedule_entry_sql = str(
+        _bulk_insert_statement(ScheduleEntryRecord).values([{"flags": ["school_days"]}]).compile(dialect=dialect)
+    )
+
+    assert "ST_GeomFromEWKT" in route_direction_sql
+    assert "ST_GeomFromEWKT" in route_segment_sql
+    assert "::JSONB" in service_direction_sql
+    assert "::JSONB" in schedule_entry_sql
+
+
 def test_unchanged_batch_reuses_canonical_stored_ids_and_updates_route_metadata(db_session: Session):
     first_snapshot = _snapshot()
     persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [first_snapshot])
@@ -207,13 +237,93 @@ def test_unchanged_batch_reuses_canonical_stored_ids_and_updates_route_metadata(
     assert version.fare_version_id == fare.id
 
 
-def _snapshot_with_directions(source_hash: str = "source-a", map_hash: str | None = "map-a") -> RouteSnapshot:
-    snapshot = _snapshot(source_hash=source_hash, map_hash=map_hash)
+def _snapshot_with_directions(
+    source_hash: str = "source-a",
+    map_hash: str | None = "map-a",
+    code: str = "110",
+) -> RouteSnapshot:
+    snapshot = _snapshot(source_hash=source_hash, map_hash=map_hash, code=code)
+    snapshot.route.service_directions = [
+        ServiceDirection(
+            sequence=1,
+            departure_label="TICEN",
+            normalized_name="TICEN",
+            direction_kind="ida",
+            schedules=[
+                ScheduleEntry(
+                    day_type="Dias uteis",
+                    departure_label="TICEN",
+                    time="06:00",
+                    flags=["school_days"],
+                )
+            ],
+        ),
+        ServiceDirection(
+            sequence=2,
+            departure_label="TITRI",
+            normalized_name="TITRI",
+            direction_kind="volta",
+            schedules=[ScheduleEntry(day_type="Sabado", departure_label="TITRI", time="07:00")],
+        ),
+    ]
+    snapshot.route.itinerary_steps = [
+        ItineraryStep(sequence=1, name="TICEN"),
+        ItineraryStep(sequence=2, name="TITRI"),
+    ]
     snapshot.directions = [
         RouteDirection(name="Ida", coordinates=[(-48.548, -27.5969), (-48.547, -27.5969)]),
         RouteDirection(name="Volta", coordinates=[(-48.547, -27.5969), (-48.548, -27.5969)]),
     ]
+    snapshot.direction_matches = [
+        ServiceDirectionMatch(
+            service_direction_sequence=1,
+            route_direction_sequence=1,
+            confidence=DirectionMatchConfidence.MEDIUM,
+            method=DirectionMatchMethod.LABEL_ORDER_IDA_VOLTA,
+            notes={"departure_label": "TICEN"},
+        ),
+        ServiceDirectionMatch(
+            service_direction_sequence=2,
+            route_direction_sequence=2,
+            confidence=DirectionMatchConfidence.MEDIUM,
+            method=DirectionMatchMethod.LABEL_ORDER_IDA_VOLTA,
+            notes={"departure_label": "TITRI"},
+        ),
+    ]
     return snapshot
+
+
+def test_persists_each_child_table_with_one_bulk_statement(db_session: Session):
+    child_tables = {
+        "route_directions",
+        "route_segments",
+        "service_directions",
+        "schedule_entries",
+        "itinerary_steps",
+    }
+    insert_executions: dict[str, list[bool]] = {table: [] for table in child_tables}
+
+    def record_child_inserts(_connection, _cursor, statement, _parameters, _context, executemany):
+        normalized = statement.lower()
+        for table in child_tables:
+            if f"insert into {table}" in normalized:
+                insert_executions[table].append(executemany)
+
+    engine = db_session.get_bind()
+    event.listen(engine, "before_cursor_execute", record_child_inserts)
+    try:
+        persist_snapshots(
+            db_session,
+            "https://www.consorciofenix.com.br/horarios",
+            [
+                _snapshot_with_directions(code="110", source_hash="source-110"),
+                _snapshot_with_directions(code="111", source_hash="source-111"),
+            ],
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_child_inserts)
+
+    assert insert_executions == {table: [True] for table in child_tables}
 
 
 def test_uuid_pk_generates_uuid_values(db_session: Session):
@@ -295,6 +405,26 @@ def test_reused_route_version_does_not_duplicate_route_segments(db_session: Sess
     assert db_session.query(RouteVersionRecord).count() == 1
     assert db_session.query(RouteDirectionRecord).count() == 2
     assert db_session.query(RouteSegmentRecord).count() == 2
+    assert db_session.query(ServiceDirectionRecord).count() == 2
+    assert db_session.query(ScheduleEntryRecord).count() == 2
+    assert db_session.query(ItineraryStepRecord).count() == 2
+
+
+def test_duplicate_snapshot_in_one_batch_does_not_duplicate_children(db_session: Session):
+    snapshot = _snapshot_with_directions(map_hash=None)
+
+    persist_snapshots(
+        db_session,
+        "https://www.consorciofenix.com.br/horarios",
+        [snapshot, snapshot],
+    )
+
+    assert db_session.query(RouteVersionRecord).count() == 1
+    assert db_session.query(RouteDirectionRecord).count() == 2
+    assert db_session.query(RouteSegmentRecord).count() == 2
+    assert db_session.query(ServiceDirectionRecord).count() == 2
+    assert db_session.query(ScheduleEntryRecord).count() == 2
+    assert db_session.query(ItineraryStepRecord).count() == 2
 
 
 def test_changed_source_hash_creates_route_version_with_own_route_segments(db_session: Session):

@@ -25,6 +25,7 @@ from sqlalchemy import (
     Uuid,
     create_engine,
     func,
+    insert,
     or_,
     select,
     update,
@@ -260,13 +261,14 @@ def persist_snapshots(session: Session, source_url: str, snapshots: Iterable[Rou
     result = ScrapeRunResult()
     try:
         reconciled_versions = _persist_snapshot_batch(session, run.id, snapshots)
+        new_versions: list[tuple[PyUUID, RouteSnapshot]] = []
         for snapshot, (version, created) in zip(snapshots, reconciled_versions, strict=True):
             result.routes += 1
             result.schedules += len(snapshot.route.schedules)
             result.geometries += len(snapshot.directions)
             result.itinerary_steps += len(snapshot.route.itinerary_steps)
             if created:
-                _persist_children(session, version.id, snapshot)
+                new_versions.append((version.id, snapshot))
             logger.info("Persisted route %s version id=%s", snapshot.route.code, version.id)
             logger.debug(
                 "Persisted route %s counts: schedules=%s directions=%s itinerary_steps=%s source_hash=%s map_hash=%s",
@@ -277,6 +279,7 @@ def persist_snapshots(session: Session, source_url: str, snapshots: Iterable[Rou
                 snapshot.source_hash,
                 snapshot.map_hash,
             )
+        _persist_children(session, new_versions)
         run.status = ScrapeStatus.SUCCESS.value
         logger.info("Finished scrape run id=%s status=%s routes=%s", run.id, run.status, result.routes)
     except Exception as exc:
@@ -629,80 +632,132 @@ def _fare_policy_hash(fare_policy: FarePolicy) -> str:
     return sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _persist_children(session: Session, route_version_id: PyUUID, snapshot: RouteSnapshot) -> None:
-    route_directions: list[RouteDirectionRecord] = []
-    direction_by_sequence: dict[int, RouteDirection] = {}
-    for index, direction in enumerate(snapshot.directions, start=1):
-        route_direction = RouteDirectionRecord(
-            route_version_id=route_version_id,
-            name=direction.name,
-            sequence=index,
-            geometry=_linestring_wkt(direction),
-        )
-        session.add(route_direction)
-        route_directions.append(route_direction)
-        direction_by_sequence[index] = direction
-    session.flush()
+class ChildRows(NamedTuple):
+    route_directions: list[dict]
+    route_segments: list[dict]
+    service_directions: list[dict]
+    schedule_entries: list[dict]
+    itinerary_steps: list[dict]
 
-    for route_direction in route_directions:
-        direction = direction_by_sequence[route_direction.sequence]
+
+def _persist_children(session: Session, new_versions: list[tuple[PyUUID, RouteSnapshot]]) -> None:
+    child_rows = ChildRows([], [], [], [], [])
+    for route_version_id, snapshot in new_versions:
+        snapshot_rows = _materialize_child_rows(route_version_id, snapshot)
+        for table_rows, snapshot_table_rows in zip(child_rows, snapshot_rows, strict=True):
+            table_rows.extend(snapshot_table_rows)
+
+    _execute_bulk_insert(session, RouteDirectionRecord, child_rows.route_directions)
+    _execute_bulk_insert(session, RouteSegmentRecord, child_rows.route_segments)
+    _execute_bulk_insert(session, ServiceDirectionRecord, child_rows.service_directions)
+    _execute_bulk_insert(session, ScheduleEntryRecord, child_rows.schedule_entries)
+    _execute_bulk_insert(session, ItineraryStepRecord, child_rows.itinerary_steps)
+
+
+def _materialize_child_rows(route_version_id: PyUUID, snapshot: RouteSnapshot) -> ChildRows:
+    route_direction_rows: list[dict] = []
+    route_direction_id_by_sequence: dict[int, PyUUID] = {}
+    for index, direction in enumerate(snapshot.directions, start=1):
+        route_direction_id = uuid4()
+        route_direction_rows.append(
+            {
+                "id": route_direction_id,
+                "route_version_id": route_version_id,
+                "name": direction.name,
+                "sequence": index,
+                "geometry": _linestring_wkt(direction),
+            }
+        )
+        route_direction_id_by_sequence[index] = route_direction_id
+
+    route_segment_rows: list[dict] = []
+    for index, direction in enumerate(snapshot.directions, start=1):
         for segment in materialize_route_segments(direction):
-            session.add(
-                RouteSegmentRecord(
-                    route_version_id=route_version_id,
-                    route_direction_id=route_direction.id,
-                    sequence=segment.sequence,
-                    source_segment_sequence=segment.source_segment_sequence,
-                    source_fraction_start=segment.source_fraction_start,
-                    source_fraction_end=segment.source_fraction_end,
-                    geometry=_segment_linestring_wkt(segment.coordinates),
-                    bearing_degrees=segment.bearing_degrees,
-                    distance_meters=segment.distance_meters,
-                    cumulative_distance_meters=segment.cumulative_distance_meters,
-                )
+            route_segment_rows.append(
+                {
+                    "id": uuid4(),
+                    "route_version_id": route_version_id,
+                    "route_direction_id": route_direction_id_by_sequence[index],
+                    "sequence": segment.sequence,
+                    "source_segment_sequence": segment.source_segment_sequence,
+                    "source_fraction_start": segment.source_fraction_start,
+                    "source_fraction_end": segment.source_fraction_end,
+                    "geometry": _segment_linestring_wkt(segment.coordinates),
+                    "bearing_degrees": segment.bearing_degrees,
+                    "distance_meters": segment.distance_meters,
+                    "cumulative_distance_meters": segment.cumulative_distance_meters,
+                }
             )
 
-    route_direction_by_sequence = {direction.sequence: direction.id for direction in route_directions}
     matches_by_service_sequence = {match.service_direction_sequence: match for match in snapshot.direction_matches}
-    service_directions: list[ServiceDirectionRecord] = []
+    service_direction_rows: list[dict] = []
+    service_direction_id_by_sequence: dict[int, PyUUID] = {}
     for service_direction in sorted(snapshot.route.service_directions, key=lambda service: service.sequence):
         match = matches_by_service_sequence.get(service_direction.sequence)
         route_direction_id = (
-            route_direction_by_sequence.get(match.route_direction_sequence)
+            route_direction_id_by_sequence.get(match.route_direction_sequence)
             if match is not None and match.route_direction_sequence is not None
             else None
         )
-        service_record = ServiceDirectionRecord(
-            route_version_id=route_version_id,
-            route_direction_id=route_direction_id,
-            sequence=service_direction.sequence,
-            departure_label=service_direction.departure_label,
-            normalized_name=service_direction.normalized_name,
-            direction_kind=service_direction.direction_kind,
-            confidence=(match.confidence.value if match is not None else DirectionMatchConfidence.NONE.value),
-            method=(match.method.value if match is not None else DirectionMatchMethod.UNMATCHED.value),
-            notes=dict(match.notes) if match is not None else {},
+        service_direction_id = uuid4()
+        service_direction_rows.append(
+            {
+                "id": service_direction_id,
+                "route_version_id": route_version_id,
+                "route_direction_id": route_direction_id,
+                "sequence": service_direction.sequence,
+                "departure_label": service_direction.departure_label,
+                "normalized_name": service_direction.normalized_name,
+                "direction_kind": service_direction.direction_kind,
+                "confidence": (match.confidence.value if match is not None else DirectionMatchConfidence.NONE.value),
+                "method": (match.method.value if match is not None else DirectionMatchMethod.UNMATCHED.value),
+                "notes": dict(match.notes) if match is not None else {},
+            }
         )
-        session.add(service_record)
-        service_directions.append(service_record)
-    session.flush()
+        service_direction_id_by_sequence[service_direction.sequence] = service_direction_id
 
-    service_direction_by_sequence = {direction.sequence: direction.id for direction in service_directions}
+    schedule_entry_rows: list[dict] = []
     for service_direction in snapshot.route.service_directions:
-        service_direction_id = service_direction_by_sequence[service_direction.sequence]
+        service_direction_id = service_direction_id_by_sequence[service_direction.sequence]
         for entry in service_direction.schedules:
-            session.add(
-                ScheduleEntryRecord(
-                    route_version_id=route_version_id,
-                    service_direction_id=service_direction_id,
-                    day_type=entry.day_type,
-                    departure_label=entry.departure_label,
-                    time=entry.time,
-                    flags=list(entry.flags),
-                )
+            schedule_entry_rows.append(
+                {
+                    "id": uuid4(),
+                    "route_version_id": route_version_id,
+                    "service_direction_id": service_direction_id,
+                    "day_type": entry.day_type,
+                    "departure_label": entry.departure_label,
+                    "time": entry.time,
+                    "flags": list(entry.flags),
+                }
             )
-    for step in snapshot.route.itinerary_steps:
-        session.add(ItineraryStepRecord(route_version_id=route_version_id, sequence=step.sequence, name=step.name))
+
+    itinerary_step_rows = [
+        {
+            "id": uuid4(),
+            "route_version_id": route_version_id,
+            "sequence": step.sequence,
+            "name": step.name,
+        }
+        for step in snapshot.route.itinerary_steps
+    ]
+
+    return ChildRows(
+        route_direction_rows,
+        route_segment_rows,
+        service_direction_rows,
+        schedule_entry_rows,
+        itinerary_step_rows,
+    )
+
+
+def _execute_bulk_insert(session: Session, record_type: type[Base], rows: list[dict]) -> None:
+    if rows:
+        session.execute(_bulk_insert_statement(record_type), rows)
+
+
+def _bulk_insert_statement(record_type: type[Base]):
+    return insert(record_type)
 
 
 def rebuild_route_segments(session: Session) -> RouteSegmentRebuildResult:
