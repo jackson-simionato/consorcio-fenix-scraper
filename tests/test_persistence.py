@@ -1,8 +1,9 @@
 from datetime import date
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -17,7 +18,9 @@ from consorcio_fenix_scraper.db import (
     ScrapeRunRecord,
     ServiceDirectionRecord,
     _linestring_wkt,
-    _persist_snapshot,
+    _postgresql_fare_version_upsert,
+    _postgresql_route_upsert,
+    _postgresql_route_version_insert,
     persist_snapshots,
 )
 from consorcio_fenix_scraper.domain import (
@@ -63,14 +66,17 @@ def _snapshot(
     source_hash: str = "source-a",
     map_hash: str | None = "map-a",
     cash_qrcode_pix_cents: int = 770,
+    code: str = "110",
 ) -> RouteSnapshot:
+    name = "TICEN - TITRI" if code == "110" else f"Route {code}"
+    slug = "ticen-titri" if code == "110" else f"route-{code}"
     return RouteSnapshot(
         route=ParsedRoutePage(
-            code="110",
-            name="TICEN - TITRI",
-            slug="ticen-titri",
-            page_url="https://www.consorciofenix.com.br/horarios/ticen-titri,110",
-            map_url="https://www.consorciofenix.com.br/mapa/110",
+            code=code,
+            name=name,
+            slug=slug,
+            page_url=f"https://www.consorciofenix.com.br/horarios/{slug},{code}",
+            map_url=f"https://www.consorciofenix.com.br/mapa/{code}",
             category="convencional",
             fare_region="Região Única",
             fare_policy=FarePolicy(
@@ -84,6 +90,121 @@ def _snapshot(
         source_hash=source_hash,
         map_hash=map_hash,
     )
+
+
+def test_persist_snapshots_batches_metadata_lookups_across_routes(db_session: Session):
+    select_statements: list[str] = []
+
+    def record_selects(_connection, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            select_statements.append(statement)
+
+    engine = db_session.get_bind()
+    event.listen(engine, "before_cursor_execute", record_selects)
+    try:
+        persist_snapshots(
+            db_session,
+            "https://www.consorciofenix.com.br/horarios",
+            [
+                _snapshot(code="110", source_hash="source-110"),
+                _snapshot(code="111", source_hash="source-111"),
+                _snapshot(code="112", source_hash="source-112"),
+            ],
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record_selects)
+
+    assert len(select_statements) == 3
+    assert db_session.query(RouteRecord).count() == 3
+    assert db_session.query(FareVersionRecord).count() == 1
+    assert db_session.query(RouteVersionRecord).count() == 3
+
+
+def test_postgresql_reconciliation_statements_return_canonical_identities():
+    route_id = UUID("00000000-0000-0000-0000-000000000001")
+    fare_version_id = UUID("00000000-0000-0000-0000-000000000002")
+    route_version_id = UUID("00000000-0000-0000-0000-000000000003")
+    scrape_run_id = UUID("00000000-0000-0000-0000-000000000004")
+    dialect = postgresql.dialect()
+
+    route_sql = str(
+        _postgresql_route_upsert(
+            [
+                {
+                    "id": route_id,
+                    "code": "110",
+                    "name": "TICEN - TITRI",
+                    "slug": "ticen-titri",
+                    "category": "convencional",
+                    "fare_region": "Região Única",
+                    "last_changed": date(2026, 5, 2),
+                    "is_current": True,
+                }
+            ]
+        ).compile(dialect=dialect)
+    )
+    fare_sql = str(
+        _postgresql_fare_version_upsert(
+            [
+                {
+                    "id": fare_version_id,
+                    "region": "Região Única",
+                    "citizen_card_cents": 620,
+                    "vt_tourist_card_cents": 720,
+                    "cash_qrcode_pix_cents": 770,
+                    "source_hash": "fare-hash",
+                    "source_url": "https://example.test/110",
+                    "is_current": True,
+                }
+            ]
+        ).compile(dialect=dialect)
+    )
+    route_version_sql = str(
+        _postgresql_route_version_insert(
+            [
+                {
+                    "id": route_version_id,
+                    "route_id": route_id,
+                    "scrape_run_id": scrape_run_id,
+                    "fare_version_id": fare_version_id,
+                    "source_hash": "source-hash",
+                    "map_hash": None,
+                    "page_url": "https://example.test/110",
+                    "map_url": None,
+                    "snapshot": {},
+                    "is_current": True,
+                }
+            ]
+        ).compile(dialect=dialect)
+    )
+
+    assert "ON CONFLICT (code) DO UPDATE" in route_sql
+    assert "RETURNING routes.code, routes.id" in route_sql
+    assert "ON CONFLICT ON CONSTRAINT uq_fare_versions_region_source_hash DO UPDATE" in fare_sql
+    assert "RETURNING fare_versions.region, fare_versions.source_hash, fare_versions.id" in fare_sql
+    assert "ON CONFLICT ON CONSTRAINT uq_route_versions_route_source_map_hash DO NOTHING" in route_version_sql
+    assert "RETURNING route_versions.route_id, route_versions.source_hash, route_versions.map_hash" in route_version_sql
+
+
+def test_unchanged_batch_reuses_canonical_stored_ids_and_updates_route_metadata(db_session: Session):
+    first_snapshot = _snapshot()
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [first_snapshot])
+    stored_route = db_session.query(RouteRecord).one()
+    stored_fare = db_session.query(FareVersionRecord).one()
+    stored_version = db_session.query(RouteVersionRecord).one()
+
+    unchanged_snapshot = _snapshot()
+    unchanged_snapshot.route.name = "Updated route name"
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [unchanged_snapshot])
+
+    route = db_session.query(RouteRecord).one()
+    fare = db_session.query(FareVersionRecord).one()
+    version = db_session.query(RouteVersionRecord).one()
+    assert route.id == stored_route.id
+    assert route.name == "Updated route name"
+    assert fare.id == stored_fare.id
+    assert version.id == stored_version.id
+    assert version.fare_version_id == fare.id
 
 
 def _snapshot_with_directions(source_hash: str = "source-a", map_hash: str | None = "map-a") -> RouteSnapshot:
@@ -105,44 +226,39 @@ def test_uuid_pk_generates_uuid_values(db_session: Session):
 
 
 def test_reuses_existing_route_version_when_source_and_map_hash_match(db_session: Session):
-    first, first_created = _persist_snapshot(db_session, uuid4(), _snapshot())
-    second, second_created = _persist_snapshot(db_session, uuid4(), _snapshot())
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot()])
+    first_id = db_session.query(RouteVersionRecord).one().id
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot()])
 
     versions = db_session.query(RouteVersionRecord).all()
 
-    assert first_created is True
-    assert second_created is False
-    assert second.id == first.id
     assert len(versions) == 1
+    assert versions[0].id == first_id
     assert versions[0].is_current is True
 
 
 def test_creates_new_route_version_when_source_hash_changes(db_session: Session):
-    first, first_created = _persist_snapshot(db_session, uuid4(), _snapshot(source_hash="source-a"))
-    second, second_created = _persist_snapshot(db_session, uuid4(), _snapshot(source_hash="source-b"))
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(source_hash="source-a")])
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(source_hash="source-b")])
 
-    versions = db_session.query(RouteVersionRecord).all()
+    versions = db_session.query(RouteVersionRecord).order_by(RouteVersionRecord.source_hash).all()
 
-    assert first_created is True
-    assert second_created is True
-    assert first.id != second.id
     assert len(versions) == 2
-    assert first.is_current is False
-    assert second.is_current is True
+    assert versions[0].id != versions[1].id
+    assert versions[0].is_current is False
+    assert versions[1].is_current is True
 
 
 def test_creates_new_route_version_when_map_hash_changes(db_session: Session):
-    first, first_created = _persist_snapshot(db_session, uuid4(), _snapshot(map_hash="map-a"))
-    second, second_created = _persist_snapshot(db_session, uuid4(), _snapshot(map_hash="map-b"))
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(map_hash="map-a")])
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(map_hash="map-b")])
 
-    versions = db_session.query(RouteVersionRecord).all()
+    versions = db_session.query(RouteVersionRecord).order_by(RouteVersionRecord.map_hash).all()
 
-    assert first_created is True
-    assert second_created is True
-    assert first.id != second.id
     assert len(versions) == 2
-    assert first.is_current is False
-    assert second.is_current is True
+    assert versions[0].id != versions[1].id
+    assert versions[0].is_current is False
+    assert versions[1].is_current is True
 
 
 def test_persists_route_segments_for_new_route_versions(db_session: Session):
@@ -171,7 +287,7 @@ def test_persists_route_segments_for_new_route_versions(db_session: Session):
 
 
 def test_reused_route_version_does_not_duplicate_route_segments(db_session: Session):
-    snapshot = _snapshot_with_directions()
+    snapshot = _snapshot_with_directions(map_hash=None)
 
     persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
     persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
@@ -234,12 +350,12 @@ def test_route_segments_schema_supports_nearby_route_discovery():
 
 
 def test_persists_route_metadata_and_links_route_version_to_fare_version(db_session: Session):
-    version, created = _persist_snapshot(db_session, uuid4(), _snapshot())
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot()])
 
     route = db_session.query(RouteRecord).one()
     fare_version = db_session.query(FareVersionRecord).one()
+    version = db_session.query(RouteVersionRecord).one()
 
-    assert created is True
     assert route.category == "convencional"
     assert route.fare_region == "Região Única"
     assert route.last_changed == date(2026, 5, 2)
@@ -254,8 +370,8 @@ def test_persists_route_metadata_and_links_route_version_to_fare_version(db_sess
 
 
 def test_reuses_existing_fare_version_for_same_policy_when_route_source_hash_changes(db_session: Session):
-    _persist_snapshot(db_session, uuid4(), _snapshot(source_hash="source-a"))
-    _persist_snapshot(db_session, uuid4(), _snapshot(source_hash="source-b"))
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(source_hash="source-a")])
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot(source_hash="source-b")])
 
     fare_versions = db_session.query(FareVersionRecord).all()
 
@@ -263,17 +379,22 @@ def test_reuses_existing_fare_version_for_same_policy_when_route_source_hash_cha
 
 
 def test_marks_previous_fare_version_non_current_when_fare_policy_changes(db_session: Session):
-    first_version, _ = _persist_snapshot(db_session, uuid4(), _snapshot(source_hash="source-a"))
-    second_version, _ = _persist_snapshot(
+    persist_snapshots(
         db_session,
-        uuid4(),
-        _snapshot(source_hash="source-b", cash_qrcode_pix_cents=790),
+        "https://www.consorciofenix.com.br/horarios",
+        [_snapshot(source_hash="source-a")],
+    )
+    persist_snapshots(
+        db_session,
+        "https://www.consorciofenix.com.br/horarios",
+        [_snapshot(source_hash="source-b", cash_qrcode_pix_cents=790)],
     )
 
     fare_versions = db_session.query(FareVersionRecord).order_by(FareVersionRecord.cash_qrcode_pix_cents).all()
+    route_versions = db_session.query(RouteVersionRecord).order_by(RouteVersionRecord.source_hash).all()
 
-    assert first_version.fare_version_id == fare_versions[0].id
-    assert second_version.fare_version_id == fare_versions[1].id
+    assert route_versions[0].fare_version_id == fare_versions[0].id
+    assert route_versions[1].fare_version_id == fare_versions[1].id
     assert {fare.cash_qrcode_pix_cents for fare in fare_versions} == {770, 790}
     assert [fare.is_current for fare in fare_versions] == [False, True]
 
@@ -350,13 +471,7 @@ def test_persists_service_directions_and_links_schedules_through_matches(db_sess
         map_hash="map-a",
     )
 
-    version, created = _persist_snapshot(db_session, uuid4(), snapshot)
-    assert created is True
-
-    from consorcio_fenix_scraper.db import _persist_children
-
-    _persist_children(db_session, version.id, snapshot)
-    db_session.flush()
+    persist_snapshots(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
 
     route_directions = db_session.query(RouteDirectionRecord).order_by(RouteDirectionRecord.sequence).all()
     service_directions = db_session.query(ServiceDirectionRecord).order_by(ServiceDirectionRecord.sequence).all()

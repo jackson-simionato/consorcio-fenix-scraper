@@ -4,11 +4,14 @@ import json
 from collections.abc import Iterable
 from datetime import UTC, date, datetime
 from hashlib import sha256
+from typing import NamedTuple
 from uuid import UUID as PyUUID, uuid4
 
 from geoalchemy2 import Geometry
 from sqlalchemy import (
+    and_,
     Boolean,
+    case,
     Date,
     DateTime,
     Float,
@@ -22,9 +25,11 @@ from sqlalchemy import (
     Uuid,
     create_engine,
     func,
+    or_,
     select,
+    update,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, insert as postgresql_insert
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 from consorcio_fenix_scraper.domain import (
@@ -246,6 +251,7 @@ def make_session_factory(database_url: str) -> sessionmaker[Session]:
 
 
 def persist_snapshots(session: Session, source_url: str, snapshots: Iterable[RouteSnapshot]) -> ScrapeRunResult:
+    snapshots = list(snapshots)
     run = ScrapeRunRecord(source_url=source_url, status=ScrapeStatus.RUNNING.value)
     session.add(run)
     session.flush()
@@ -253,8 +259,8 @@ def persist_snapshots(session: Session, source_url: str, snapshots: Iterable[Rou
 
     result = ScrapeRunResult()
     try:
-        for snapshot in snapshots:
-            version, created = _persist_snapshot(session, run.id, snapshot)
+        reconciled_versions = _persist_snapshot_batch(session, run.id, snapshots)
+        for snapshot, (version, created) in zip(snapshots, reconciled_versions, strict=True):
             result.routes += 1
             result.schedules += len(snapshot.route.schedules)
             result.geometries += len(snapshot.directions)
@@ -283,85 +289,339 @@ def persist_snapshots(session: Session, source_url: str, snapshots: Iterable[Rou
     return result
 
 
-def _persist_snapshot(session: Session, run_id: PyUUID, snapshot: RouteSnapshot) -> tuple[RouteVersionRecord, bool]:
-    route = session.scalar(select(RouteRecord).where(RouteRecord.code == snapshot.route.code))
-    if route is None:
-        route = RouteRecord(code=snapshot.route.code, name=snapshot.route.name, slug=snapshot.route.slug)
-        session.add(route)
+class RouteVersionKey(NamedTuple):
+    route_id: PyUUID
+    source_hash: str
+    map_hash: str | None
+
+
+class FareVersionKey(NamedTuple):
+    region: str
+    source_hash: str
+
+
+def _persist_snapshot_batch(
+    session: Session,
+    run_id: PyUUID,
+    snapshots: list[RouteSnapshot],
+) -> list[tuple[RouteVersionRecord, bool]]:
+    if not snapshots:
+        return []
+
+    route_ids = _reconcile_routes(session, snapshots)
+    fare_version_ids = _reconcile_fare_versions(session, snapshots)
+    return _reconcile_route_versions(session, run_id, snapshots, route_ids, fare_version_ids)
+
+
+def _reconcile_routes(session: Session, snapshots: list[RouteSnapshot]) -> dict[str, PyUUID]:
+    latest_by_code = {snapshot.route.code: snapshot for snapshot in snapshots}
+    codes = list(latest_by_code)
+
+    if session.get_bind().dialect.name == "postgresql":
+        stored_ids = dict(session.execute(select(RouteRecord.code, RouteRecord.id).where(RouteRecord.code.in_(codes))))
+        rows = [_route_values(snapshot, stored_ids.get(code, uuid4())) for code, snapshot in latest_by_code.items()]
+        return dict(session.execute(_postgresql_route_upsert(rows)))
+
+    stored_routes = {
+        route.code: route for route in session.scalars(select(RouteRecord).where(RouteRecord.code.in_(codes)))
+    }
+    for code, snapshot in latest_by_code.items():
+        route = stored_routes.get(code)
+        if route is None:
+            route = RouteRecord(**_route_values(snapshot, uuid4()))
+            stored_routes[code] = route
+            session.add(route)
+        else:
+            values = _route_values(snapshot, route.id)
+            for name, value in values.items():
+                if name != "id":
+                    setattr(route, name, value)
+    session.flush()
+    return {code: route.id for code, route in stored_routes.items()}
+
+
+def _route_values(snapshot: RouteSnapshot, route_id: PyUUID) -> dict:
+    route = snapshot.route
+    return {
+        "id": route_id,
+        "code": route.code,
+        "name": route.name,
+        "slug": route.slug,
+        "category": route.category,
+        "fare_region": route.fare_region,
+        "last_changed": route.last_changed,
+        "is_current": True,
+    }
+
+
+def _postgresql_route_upsert(rows: list[dict]):
+    statement = postgresql_insert(RouteRecord).values(rows)
+    excluded = statement.excluded
+    return statement.on_conflict_do_update(
+        index_elements=[RouteRecord.code],
+        set_={
+            "name": excluded.name,
+            "slug": excluded.slug,
+            "category": excluded.category,
+            "fare_region": excluded.fare_region,
+            "last_changed": excluded.last_changed,
+            "is_current": excluded.is_current,
+        },
+    ).returning(RouteRecord.code, RouteRecord.id)
+
+
+def _reconcile_fare_versions(session: Session, snapshots: list[RouteSnapshot]) -> dict[FareVersionKey, PyUUID]:
+    fare_inputs: dict[FareVersionKey, tuple[FarePolicy, str]] = {}
+    current_key_by_region: dict[str, FareVersionKey] = {}
+    for snapshot in snapshots:
+        fare_policy = snapshot.route.fare_policy
+        if fare_policy is None:
+            continue
+        key = FareVersionKey(fare_policy.region, _fare_policy_hash(fare_policy))
+        fare_inputs.setdefault(key, (fare_policy, snapshot.route.page_url))
+        current_key_by_region[fare_policy.region] = key
+
+    if not fare_inputs:
+        return {}
+
+    regions = list(current_key_by_region)
+    fare_identity_predicate = or_(
+        *(
+            and_(FareVersionRecord.region == key.region, FareVersionRecord.source_hash == key.source_hash)
+            for key in fare_inputs
+        )
+    )
+    stored_fares = list(session.scalars(select(FareVersionRecord).where(fare_identity_predicate)))
+    stored_ids = {FareVersionKey(fare.region, fare.source_hash): fare.id for fare in stored_fares}
+
+    if session.get_bind().dialect.name == "postgresql":
+        rows = [
+            _fare_version_values(fare_policy, source_url, stored_ids.get(key, uuid4()))
+            for key, (fare_policy, source_url) in fare_inputs.items()
+        ]
+        canonical_ids = {
+            FareVersionKey(region, source_hash): fare_id
+            for region, source_hash, fare_id in session.execute(_postgresql_fare_version_upsert(rows))
+        }
+        session.execute(
+            update(FareVersionRecord).where(FareVersionRecord.region.in_(regions)).values(is_current=False)
+        )
+        current_ids = [canonical_ids[key] for key in current_key_by_region.values()]
+        session.execute(update(FareVersionRecord).where(FareVersionRecord.id.in_(current_ids)).values(is_current=True))
+        return canonical_ids
+
+    by_key = {FareVersionKey(fare.region, fare.source_hash): fare for fare in stored_fares}
+    for key, (fare_policy, source_url) in fare_inputs.items():
+        if key not in by_key:
+            fare = FareVersionRecord(**_fare_version_values(fare_policy, source_url, uuid4()))
+            by_key[key] = fare
+            stored_fares.append(fare)
+            session.add(fare)
+    session.execute(update(FareVersionRecord).where(FareVersionRecord.region.in_(regions)).values(is_current=False))
+    current_keys = set(current_key_by_region.values())
+    for fare in stored_fares:
+        fare.is_current = FareVersionKey(fare.region, fare.source_hash) in current_keys
+    session.flush()
+    return {key: fare.id for key, fare in by_key.items()}
+
+
+def _fare_version_values(fare_policy: FarePolicy, source_url: str, fare_version_id: PyUUID) -> dict:
+    return {
+        "id": fare_version_id,
+        "region": fare_policy.region,
+        "citizen_card_cents": fare_policy.citizen_card_cents,
+        "vt_tourist_card_cents": fare_policy.vt_tourist_card_cents,
+        "cash_qrcode_pix_cents": fare_policy.cash_qrcode_pix_cents,
+        "source_hash": _fare_policy_hash(fare_policy),
+        "source_url": source_url,
+        "is_current": True,
+    }
+
+
+def _postgresql_fare_version_upsert(rows: list[dict]):
+    statement = postgresql_insert(FareVersionRecord).values(rows)
+    excluded = statement.excluded
+    return statement.on_conflict_do_update(
+        constraint="uq_fare_versions_region_source_hash",
+        set_={"is_current": excluded.is_current},
+    ).returning(FareVersionRecord.region, FareVersionRecord.source_hash, FareVersionRecord.id)
+
+
+def _reconcile_route_versions(
+    session: Session,
+    run_id: PyUUID,
+    snapshots: list[RouteSnapshot],
+    route_ids: dict[str, PyUUID],
+    fare_version_ids: dict[FareVersionKey, PyUUID],
+) -> list[tuple[RouteVersionRecord, bool]]:
+    affected_route_ids = list({route_ids[snapshot.route.code] for snapshot in snapshots})
+    proposed_keys = {_snapshot_route_version_key(snapshot, route_ids) for snapshot in snapshots}
+    identity_predicate = _route_version_identity_predicate(proposed_keys)
+    stored_versions = list(
+        session.scalars(select(RouteVersionRecord).where(identity_predicate))
+    )
+    by_key = {_stored_route_version_key(version): version for version in stored_versions}
+    proposed_by_key: dict[RouteVersionKey, tuple[PyUUID, RouteSnapshot, PyUUID | None]] = {}
+    for snapshot in snapshots:
+        key = _snapshot_route_version_key(snapshot, route_ids)
+        proposed_by_key.setdefault(key, (uuid4(), snapshot, _fare_version_id(snapshot, fare_version_ids)))
+
+    new_keys = set(proposed_by_key) - set(by_key)
+    if session.get_bind().dialect.name == "postgresql":
+        inserted_keys = _insert_postgresql_route_versions(session, run_id, proposed_by_key, new_keys)
+        stored_versions = list(
+            session.scalars(select(RouteVersionRecord).where(identity_predicate))
+        )
+        by_key = {_stored_route_version_key(version): version for version in stored_versions}
+        new_keys = inserted_keys
+        _update_postgresql_route_versions(session, snapshots, route_ids, fare_version_ids, by_key)
+    else:
+        for key in new_keys:
+            version_id, snapshot, fare_version_id = proposed_by_key[key]
+            version = RouteVersionRecord(
+                **_route_version_values(version_id, run_id, snapshot, route_ids[snapshot.route.code], fare_version_id)
+            )
+            by_key[key] = version
+            stored_versions.append(version)
+            session.add(version)
+        session.execute(
+            update(RouteVersionRecord)
+            .where(RouteVersionRecord.route_id.in_(affected_route_ids))
+            .values(is_current=False)
+        )
+        for snapshot in snapshots:
+            key = _snapshot_route_version_key(snapshot, route_ids)
+            by_key[key].fare_version_id = _fare_version_id(snapshot, fare_version_ids)
+        for snapshot in {snapshot.route.code: snapshot for snapshot in snapshots}.values():
+            key = _snapshot_route_version_key(snapshot, route_ids)
+            by_key[key].is_current = True
         session.flush()
 
-    route.name = snapshot.route.name
-    route.slug = snapshot.route.slug
-    route.category = snapshot.route.category
-    route.fare_region = snapshot.route.fare_region
-    route.last_changed = snapshot.route.last_changed
-    route.is_current = True
-    fare_version = _persist_fare_version(session, snapshot)
+    results: list[tuple[RouteVersionRecord, bool]] = []
+    emitted_new_keys: set[RouteVersionKey] = set()
+    for snapshot in snapshots:
+        key = _snapshot_route_version_key(snapshot, route_ids)
+        created = key in new_keys and key not in emitted_new_keys
+        results.append((by_key[key], created))
+        if created:
+            emitted_new_keys.add(key)
+    return results
 
-    existing_version = session.scalar(
-        select(RouteVersionRecord).where(
-            RouteVersionRecord.route_id == route.id,
-            RouteVersionRecord.source_hash == snapshot.source_hash,
-            RouteVersionRecord.map_hash.is_not_distinct_from(snapshot.map_hash),
+
+def _insert_postgresql_route_versions(
+    session: Session,
+    run_id: PyUUID,
+    proposed_by_key: dict[RouteVersionKey, tuple[PyUUID, RouteSnapshot, PyUUID | None]],
+    new_keys: set[RouteVersionKey],
+) -> set[RouteVersionKey]:
+    if not new_keys:
+        return set()
+    rows = [
+        _route_version_values(version_id, run_id, snapshot, key.route_id, fare_version_id)
+        for key, (version_id, snapshot, fare_version_id) in proposed_by_key.items()
+        if key in new_keys
+    ]
+    return {
+        RouteVersionKey(route_id, source_hash, map_hash)
+        for route_id, source_hash, map_hash in session.execute(_postgresql_route_version_insert(rows))
+    }
+
+
+def _postgresql_route_version_insert(rows: list[dict]):
+    return (
+        postgresql_insert(RouteVersionRecord)
+        .values(rows)
+        .on_conflict_do_nothing(constraint="uq_route_versions_route_source_map_hash")
+        .returning(
+            RouteVersionRecord.route_id,
+            RouteVersionRecord.source_hash,
+            RouteVersionRecord.map_hash,
         )
     )
 
-    session.query(RouteVersionRecord).filter(RouteVersionRecord.route_id == route.id).update({"is_current": False})
-    if existing_version is not None:
-        existing_version.fare_version_id = fare_version.id if fare_version is not None else None
-        existing_version.is_current = True
-        session.flush()
-        return existing_version, False
 
-    version = RouteVersionRecord(
-        route_id=route.id,
-        scrape_run_id=run_id,
-        fare_version_id=fare_version.id if fare_version is not None else None,
-        source_hash=snapshot.source_hash,
-        map_hash=snapshot.map_hash,
-        page_url=snapshot.route.page_url,
-        map_url=snapshot.route.map_url,
-        snapshot=snapshot.model_dump(mode="json"),
-        is_current=True,
+def _update_postgresql_route_versions(
+    session: Session,
+    snapshots: list[RouteSnapshot],
+    route_ids: dict[str, PyUUID],
+    fare_version_ids: dict[FareVersionKey, PyUUID],
+    by_key: dict[RouteVersionKey, RouteVersionRecord],
+) -> None:
+    affected_route_ids = list({route_ids[snapshot.route.code] for snapshot in snapshots})
+    session.execute(
+        update(RouteVersionRecord)
+        .where(RouteVersionRecord.route_id.in_(affected_route_ids))
+        .values(is_current=False)
     )
-    session.add(version)
-    session.flush()
-    return version, True
+    fare_id_by_version_id: dict[PyUUID, PyUUID | None] = {}
+    for snapshot in snapshots:
+        key = _snapshot_route_version_key(snapshot, route_ids)
+        fare_id_by_version_id[by_key[key].id] = _fare_version_id(snapshot, fare_version_ids)
+    session.execute(
+        update(RouteVersionRecord)
+        .where(RouteVersionRecord.id.in_(fare_id_by_version_id))
+        .values(fare_version_id=case(fare_id_by_version_id, value=RouteVersionRecord.id))
+    )
+    latest_by_code = {snapshot.route.code: snapshot for snapshot in snapshots}
+    current_ids = [
+        by_key[_snapshot_route_version_key(snapshot, route_ids)].id for snapshot in latest_by_code.values()
+    ]
+    session.execute(update(RouteVersionRecord).where(RouteVersionRecord.id.in_(current_ids)).values(is_current=True))
 
 
-def _persist_fare_version(session: Session, snapshot: RouteSnapshot) -> FareVersionRecord | None:
+def _route_version_values(
+    version_id: PyUUID,
+    run_id: PyUUID,
+    snapshot: RouteSnapshot,
+    route_id: PyUUID,
+    fare_version_id: PyUUID | None,
+) -> dict:
+    return {
+        "id": version_id,
+        "route_id": route_id,
+        "scrape_run_id": run_id,
+        "fare_version_id": fare_version_id,
+        "source_hash": snapshot.source_hash,
+        "map_hash": snapshot.map_hash,
+        "page_url": snapshot.route.page_url,
+        "map_url": snapshot.route.map_url,
+        "snapshot": snapshot.model_dump(mode="json"),
+        "is_current": True,
+    }
+
+
+def _snapshot_route_version_key(
+    snapshot: RouteSnapshot,
+    route_ids: dict[str, PyUUID],
+) -> RouteVersionKey:
+    return RouteVersionKey(route_ids[snapshot.route.code], snapshot.source_hash, snapshot.map_hash)
+
+
+def _stored_route_version_key(version: RouteVersionRecord) -> RouteVersionKey:
+    return RouteVersionKey(version.route_id, version.source_hash, version.map_hash)
+
+
+def _route_version_identity_predicate(keys: set[RouteVersionKey]):
+    return or_(
+        *(
+            and_(
+                RouteVersionRecord.route_id == key.route_id,
+                RouteVersionRecord.source_hash == key.source_hash,
+                RouteVersionRecord.map_hash.is_not_distinct_from(key.map_hash),
+            )
+            for key in keys
+        )
+    )
+
+
+def _fare_version_id(
+    snapshot: RouteSnapshot,
+    fare_version_ids: dict[FareVersionKey, PyUUID],
+) -> PyUUID | None:
     fare_policy = snapshot.route.fare_policy
     if fare_policy is None:
         return None
-
-    existing = session.scalar(
-        select(FareVersionRecord).where(
-            FareVersionRecord.region == fare_policy.region,
-            FareVersionRecord.source_hash == _fare_policy_hash(fare_policy),
-        )
-    )
-    if existing is None:
-        session.query(FareVersionRecord).filter(FareVersionRecord.region == fare_policy.region).update({"is_current": False})
-        existing = FareVersionRecord(
-            region=fare_policy.region,
-            citizen_card_cents=fare_policy.citizen_card_cents,
-            vt_tourist_card_cents=fare_policy.vt_tourist_card_cents,
-            cash_qrcode_pix_cents=fare_policy.cash_qrcode_pix_cents,
-            source_hash=_fare_policy_hash(fare_policy),
-            source_url=snapshot.route.page_url,
-            is_current=True,
-        )
-        session.add(existing)
-        session.flush()
-        return existing
-
-    session.query(FareVersionRecord).filter(
-        FareVersionRecord.region == fare_policy.region,
-        FareVersionRecord.id != existing.id,
-    ).update({"is_current": False})
-    existing.is_current = True
-    session.flush()
-    return existing
+    return fare_version_ids[FareVersionKey(fare_policy.region, _fare_policy_hash(fare_policy))]
 
 
 def _fare_policy_hash(fare_policy: FarePolicy) -> str:
