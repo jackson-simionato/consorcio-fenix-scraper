@@ -2,11 +2,12 @@ from datetime import date
 from uuid import UUID
 
 import pytest
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, literal, select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+import consorcio_fenix_scraper.db as db
 from consorcio_fenix_scraper.db import (
     Base,
     FareVersionRecord,
@@ -130,6 +131,12 @@ def test_persist_snapshots_batches_metadata_lookups_across_routes(db_session: Se
     assert db_session.query(RouteRecord).count() == 3
     assert db_session.query(FareVersionRecord).count() == 1
     assert db_session.query(RouteVersionRecord).count() == 3
+
+
+def test_sqlalchemy_pair_results_materialize_as_a_dictionary(db_session: Session):
+    result = db_session.execute(select(literal("100"), literal("route-id")))
+
+    assert db._pair_result_dict(result) == {"100": "route-id"}
 
 
 def test_postgresql_reconciliation_statements_return_canonical_identities():

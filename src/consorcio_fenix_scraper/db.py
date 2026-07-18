@@ -479,9 +479,11 @@ def _reconcile_routes(session: Session, snapshots: list[RouteSnapshot]) -> dict[
     codes = list(latest_by_code)
 
     if session.get_bind().dialect.name == "postgresql":
-        stored_ids = dict(session.execute(select(RouteRecord.code, RouteRecord.id).where(RouteRecord.code.in_(codes))))
+        stored_ids = _pair_result_dict(
+            session.execute(select(RouteRecord.code, RouteRecord.id).where(RouteRecord.code.in_(codes)))
+        )
         rows = [_route_values(snapshot, stored_ids.get(code, uuid4())) for code, snapshot in latest_by_code.items()]
-        return dict(session.execute(_postgresql_route_upsert(rows)))
+        return _pair_result_dict(session.execute(_postgresql_route_upsert(rows)))
 
     stored_routes = {
         route.code: route for route in session.scalars(select(RouteRecord).where(RouteRecord.code.in_(codes)))
@@ -513,6 +515,10 @@ def _route_values(snapshot: RouteSnapshot, route_id: PyUUID) -> dict:
         "last_changed": route.last_changed,
         "is_current": True,
     }
+
+
+def _pair_result_dict(result) -> dict:
+    return dict(result.tuples().all())
 
 
 def _postgresql_route_upsert(rows: list[dict]):
