@@ -48,6 +48,17 @@ def test_route_page_parser_keeps_hyphenated_route_codes_from_url():
     assert route.slug == "bairro-de-fatima"
 
 
+def test_route_page_parser_removes_site_suffix_from_route_name():
+    html = "<html><body><h1>631 - Capoeiras | Linha | Consórcio Fênix</h1></body></html>"
+
+    route = parse_route_page(
+        html,
+        page_url="https://www.consorciofenix.com.br/horarios/capoeiras,631",
+    )
+
+    assert route.name == "Capoeiras"
+
+
 def test_route_page_parser_falls_back_to_slug_name_for_arbitrary_codes():
     route = parse_route_page(
         "<html><body></body></html>",

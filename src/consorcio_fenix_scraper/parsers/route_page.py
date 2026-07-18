@@ -43,7 +43,13 @@ def _parse_title(soup: BeautifulSoup, page_url: str) -> tuple[str, str]:
     if title:
         separator_match = re.match(rf"\s*{re.escape(code)}\s*[-\u2013]\s*(.+?)\s*$", title, re.IGNORECASE)
         if separator_match:
-            return code, separator_match.group(1)
+            name = re.sub(
+                r"\s*\|\s*Linha\s*\|\s*Consórcio Fênix\s*$",
+                "",
+                separator_match.group(1),
+                flags=re.IGNORECASE,
+            )
+            return code, name
     return code, slug.replace("-", " ").title()
 
 
