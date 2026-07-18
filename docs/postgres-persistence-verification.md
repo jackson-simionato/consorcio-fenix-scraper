@@ -27,6 +27,14 @@ failures, active-batch rollback, durable failed status, and retry reuse:
 uv run pytest -q tests/test_batch_persistence.py tests/test_persistence.py tests/test_cli.py
 ```
 
-No performance thresholds or benchmark acceptance gates are part of either command. Inspect structured
-`persistence_batch_complete`, `persistence_batch_failed`, and `persistence_complete` logs for operational duration,
-proposed-row count, and throughput evidence. CLI stdout remains the concise count summary.
+No performance thresholds or benchmark acceptance gates are part of either command. Logs are written to stderr so
+CLI stdout remains the stable, concise count summary. Inspect these structured events:
+
+- `fetch_complete`: fetched Route count, duration, and Routes per second.
+- `persistence_batch_complete`: committed batch number, Route count, proposed-row count, duration, and rows per
+  second.
+- `persistence_batch_failed`: the same batch context for the active transaction that rolled back.
+- `persistence_complete`: successful Scrape Run totals, duration, and rows per second.
+
+Database writes use one sequential writer. A failed data batch is rolled back independently, and failed Scrape Run
+finalization is retried in a fresh control transaction before the original persistence error is returned.

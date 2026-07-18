@@ -23,6 +23,7 @@ from consorcio_fenix_scraper.db import (
     _postgresql_fare_version_upsert,
     _postgresql_route_upsert,
     _postgresql_route_version_insert,
+    _prepare_snapshot,
     _persist_data_batch,
 )
 from consorcio_fenix_scraper.domain import (
@@ -100,7 +101,7 @@ def _persist_batch_for_test(session: Session, source_url: str, snapshots: list[R
     run = ScrapeRunRecord(source_url=source_url)
     session.add(run)
     session.flush()
-    return _persist_data_batch(session, run.id, snapshots)
+    return _persist_data_batch(session, run.id, [_prepare_snapshot(snapshot) for snapshot in snapshots])
 
 
 def test_persist_snapshots_batches_metadata_lookups_across_routes(db_session: Session):

@@ -51,4 +51,4 @@ dry-run:
 		--map-html tests/fixtures/map_page.html
 
 scrape:
-	uv run consorcio-fenix scrape-routes
+	uv run consorcio-fenix scrape-routes --limit "$(LIMIT)"

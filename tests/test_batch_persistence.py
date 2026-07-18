@@ -134,12 +134,17 @@ def _normalized_database(session: Session) -> dict[str, list[tuple]]:
 
 def test_row_weighted_batches_preserve_order_and_allow_oversized_route():
     snapshots = [_snapshot("100"), _snapshot("200"), _snapshot("300")]
-    weights = [db._snapshot_row_count(snapshot) for snapshot in snapshots]
+    weights = [db._prepare_snapshot(snapshot).row_count for snapshot in snapshots]
 
-    batches = list(db._batch_snapshots(snapshots, max_rows=weights[0] + weights[1] - 1))
+    batches = list(db._batch_prepared_snapshots(snapshots, max_rows=weights[0] + weights[1] - 1))
 
-    assert [[snapshot.route.code for snapshot in batch] for batch in batches] == [["100"], ["200"], ["300"]]
-    assert list(db._batch_snapshots([snapshots[0]], max_rows=1)) == [[snapshots[0]]]
+    assert [[prepared.snapshot.route.code for prepared in batch] for batch, _ in batches] == [
+        ["100"],
+        ["200"],
+        ["300"],
+    ]
+    oversized_batches = list(db._batch_prepared_snapshots([snapshots[0]], max_rows=1))
+    assert [[prepared.snapshot for prepared in batch] for batch, _ in oversized_batches] == [[snapshots[0]]]
 
 
 def test_batch_persistence_logs_rows_duration_and_throughput(tmp_path, caplog):
@@ -153,6 +158,28 @@ def test_batch_persistence_logs_rows_duration_and_throughput(tmp_path, caplog):
     assert "duration_seconds=" in caplog.text
     assert "rows_per_second=" in caplog.text
     assert "persistence_complete" in caplog.text
+
+
+def test_persistence_materializes_each_route_direction_once(tmp_path, monkeypatch, complete_snapshot_factory):
+    session_factory = _session_factory(tmp_path)
+    real_materialize = db.materialize_route_segments
+    materialized_directions = 0
+
+    def count_materialization(direction):
+        nonlocal materialized_directions
+        materialized_directions += 1
+        return real_materialize(direction)
+
+    monkeypatch.setattr(db, "materialize_route_segments", count_materialization)
+
+    persist_snapshots(
+        session_factory,
+        "https://example.test/horarios",
+        [complete_snapshot_factory("100")],
+        max_batch_rows=10_000,
+    )
+
+    assert materialized_directions == 1
 
 
 def test_cold_unchanged_and_changed_subsets_preserve_normalized_history_without_duplicate_children(
@@ -276,7 +303,7 @@ def test_materialization_error_is_recorded_on_scrape_run(tmp_path, monkeypatch):
     def fail_materialization(_snapshot):
         raise RuntimeError("materialization failed")
 
-    monkeypatch.setattr(db, "_snapshot_row_count", fail_materialization)
+    monkeypatch.setattr(db, "_prepare_snapshot", fail_materialization)
 
     with pytest.raises(RuntimeError, match="materialization failed"):
         persist_snapshots(session_factory, "https://example.test/horarios", [_snapshot("100")])
@@ -307,3 +334,33 @@ def test_success_finalization_error_falls_back_to_failed_status(tmp_path, monkey
         assert run.status == ScrapeStatus.FAILED.value
         assert run.finished_at is not None
         assert run.error_summary == "success finalization failed"
+
+
+def test_failed_status_finalization_retries_in_a_fresh_control_transaction(tmp_path, monkeypatch):
+    session_factory = _session_factory(tmp_path)
+    real_finish = db._finish_scrape_run
+    failed_finalization_attempts = 0
+
+    def fail_first_failed_status(factory, run_id, status, *, error_summary=None):
+        nonlocal failed_finalization_attempts
+        if status is ScrapeStatus.FAILED:
+            failed_finalization_attempts += 1
+            if failed_finalization_attempts == 1:
+                raise RuntimeError("transient control transaction failure")
+        return real_finish(factory, run_id, status, error_summary=error_summary)
+
+    def fail_materialization(_snapshot):
+        raise RuntimeError("materialization failed")
+
+    monkeypatch.setattr(db, "_finish_scrape_run", fail_first_failed_status)
+    monkeypatch.setattr(db, "_prepare_snapshot", fail_materialization)
+
+    with pytest.raises(RuntimeError, match="materialization failed"):
+        persist_snapshots(session_factory, "https://example.test/horarios", [_snapshot("100")])
+
+    with session_factory() as session:
+        run = session.query(ScrapeRunRecord).one()
+        assert failed_finalization_attempts == 2
+        assert run.status == ScrapeStatus.FAILED.value
+        assert run.finished_at is not None
+        assert run.error_summary == "materialization failed"

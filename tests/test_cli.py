@@ -13,6 +13,7 @@ from consorcio_fenix_scraper.db import (
     RouteDirectionRecord,
     RouteSegmentRecord,
     ScrapeRunRecord,
+    _prepare_snapshot,
     _persist_data_batch,
 )
 from consorcio_fenix_scraper.domain import ParsedRoutePage, RouteDirection, RouteSnapshot
@@ -235,7 +236,7 @@ def test_rebuild_route_segments_cli_rebuilds_from_stored_route_directions(tmp_pa
         run = ScrapeRunRecord(source_url="https://example.test/horarios")
         session.add(run)
         session.flush()
-        _persist_data_batch(session, run.id, [_snapshot_with_direction()])
+        _persist_data_batch(session, run.id, [_prepare_snapshot(_snapshot_with_direction())])
         session.query(RouteSegmentRecord).delete()
 
     result = runner.invoke(app, ["rebuild-route-segments", "--database-url", database_url])
@@ -260,7 +261,7 @@ def test_rebuild_route_segments_cli_is_idempotent_and_does_not_rescrape(tmp_path
         run = ScrapeRunRecord(source_url="https://example.test/horarios")
         session.add(run)
         session.flush()
-        _persist_data_batch(session, run.id, [_snapshot_with_direction()])
+        _persist_data_batch(session, run.id, [_prepare_snapshot(_snapshot_with_direction())])
 
     async def fail_fetch(*_args, **_kwargs):
         raise AssertionError("rebuild must not fetch route pages")

@@ -58,6 +58,21 @@ class Base(DeclarativeBase):
 JSON_TYPE = JSON().with_variant(JSONB, "postgresql")
 
 
+class ChildRows(NamedTuple):
+    route_directions: list[dict]
+    route_segments: list[dict]
+    service_directions: list[dict]
+    schedule_entries: list[dict]
+    itinerary_steps: list[dict]
+
+
+class PreparedSnapshot(NamedTuple):
+    snapshot: RouteSnapshot
+    proposed_version_id: PyUUID
+    child_rows: ChildRows
+    row_count: int
+
+
 def _uuid_pk():
     return mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
 
@@ -267,13 +282,12 @@ def persist_snapshots(
     result = ScrapeRunResult()
 
     try:
-        snapshots = list(snapshots)
-        weighted_snapshots = [(snapshot, _snapshot_row_count(snapshot)) for snapshot in snapshots]
-        proposed_rows = sum(row_count for _, row_count in weighted_snapshots)
+        proposed_rows = 0
         for batch_number, (batch, batch_rows) in enumerate(
-            _batch_weighted_snapshots(weighted_snapshots, max_batch_rows),
+            _batch_prepared_snapshots(snapshots, max_batch_rows),
             start=1,
         ):
+            proposed_rows += batch_rows
             batch_started = perf_counter()
             try:
                 with session_factory.begin() as session:
@@ -308,7 +322,8 @@ def persist_snapshots(
         try:
             _finish_scrape_run(session_factory, run_id, ScrapeStatus.FAILED, error_summary=str(exc))
         except Exception:
-            logger.exception("Could not durably finalize failed scrape run id=%s", run_id)
+            logger.exception("Retrying failed scrape run finalization id=%s", run_id)
+            _finish_scrape_run(session_factory, run_id, ScrapeStatus.FAILED, error_summary=str(exc))
         logger.exception("Scrape run id=%s failed: %s", run_id, exc)
         raise
 
@@ -352,41 +367,32 @@ def _finish_scrape_run(
         run.finished_at = datetime.now(UTC)
 
 
-def _snapshot_row_count(snapshot: RouteSnapshot) -> int:
+def _prepare_snapshot(snapshot: RouteSnapshot) -> PreparedSnapshot:
+    proposed_version_id = uuid4()
+    child_rows = _materialize_child_rows(proposed_version_id, snapshot)
     metadata_rows = 2 + int(snapshot.route.fare_policy is not None)
-    child_rows = (
-        len(snapshot.directions)
-        + sum(len(materialize_route_segments(direction)) for direction in snapshot.directions)
-        + len(snapshot.route.service_directions)
-        + sum(len(service.schedules) for service in snapshot.route.service_directions)
-        + len(snapshot.route.itinerary_steps)
-    )
-    return metadata_rows + child_rows
+    row_count = metadata_rows + sum(len(rows) for rows in child_rows)
+    return PreparedSnapshot(snapshot, proposed_version_id, child_rows, row_count)
 
 
-def _batch_snapshots(snapshots: list[RouteSnapshot], max_rows: int) -> Iterable[list[RouteSnapshot]]:
-    weighted_snapshots = [(snapshot, _snapshot_row_count(snapshot)) for snapshot in snapshots]
-    for batch, _ in _batch_weighted_snapshots(weighted_snapshots, max_rows):
-        yield batch
-
-
-def _batch_weighted_snapshots(
-    weighted_snapshots: list[tuple[RouteSnapshot, int]],
+def _batch_prepared_snapshots(
+    snapshots: Iterable[RouteSnapshot],
     max_rows: int,
-) -> Iterable[tuple[list[RouteSnapshot], int]]:
+) -> Iterable[tuple[list[PreparedSnapshot], int]]:
     if max_rows < 1:
         raise ValueError("max_rows must be greater than zero")
 
-    batch: list[RouteSnapshot] = []
+    batch: list[PreparedSnapshot] = []
     batch_rows = 0
-    for snapshot, snapshot_rows in weighted_snapshots:
-        if batch and batch_rows + snapshot_rows > max_rows:
+    for snapshot in snapshots:
+        prepared = _prepare_snapshot(snapshot)
+        if batch and batch_rows + prepared.row_count > max_rows:
             yield batch, batch_rows
             batch = []
             batch_rows = 0
-        batch.append(snapshot)
-        batch_rows += snapshot_rows
-        if snapshot_rows > max_rows:
+        batch.append(prepared)
+        batch_rows += prepared.row_count
+        if prepared.row_count > max_rows:
             yield batch, batch_rows
             batch = []
             batch_rows = 0
@@ -408,17 +414,20 @@ def _add_result(target: ScrapeRunResult, increment: ScrapeRunResult) -> None:
     target.failures.extend(increment.failures)
 
 
-def _persist_data_batch(session: Session, run_id: PyUUID, snapshots: list[RouteSnapshot]) -> ScrapeRunResult:
+def _persist_data_batch(session: Session, run_id: PyUUID, prepared_snapshots: list[PreparedSnapshot]) -> ScrapeRunResult:
     result = ScrapeRunResult()
-    reconciled_versions = _persist_snapshot_batch(session, run_id, snapshots)
-    new_versions: list[tuple[PyUUID, RouteSnapshot]] = []
-    for snapshot, (version, created) in zip(snapshots, reconciled_versions, strict=True):
+    snapshots = [prepared.snapshot for prepared in prepared_snapshots]
+    proposed_version_ids = [prepared.proposed_version_id for prepared in prepared_snapshots]
+    reconciled_versions = _persist_snapshot_batch(session, run_id, snapshots, proposed_version_ids)
+    new_versions: list[PreparedSnapshot] = []
+    for prepared, (version, created) in zip(prepared_snapshots, reconciled_versions, strict=True):
+        snapshot = prepared.snapshot
         result.routes += 1
         result.schedules += len(snapshot.route.schedules)
         result.geometries += len(snapshot.directions)
         result.itinerary_steps += len(snapshot.route.itinerary_steps)
         if created:
-            new_versions.append((version.id, snapshot))
+            new_versions.append(prepared)
         logger.info("Persisted route %s version id=%s", snapshot.route.code, version.id)
         logger.debug(
             "Persisted route %s counts: schedules=%s directions=%s itinerary_steps=%s source_hash=%s map_hash=%s",
@@ -448,13 +457,21 @@ def _persist_snapshot_batch(
     session: Session,
     run_id: PyUUID,
     snapshots: list[RouteSnapshot],
+    proposed_version_ids: list[PyUUID],
 ) -> list[tuple[RouteVersionRecord, bool]]:
     if not snapshots:
         return []
 
     route_ids = _reconcile_routes(session, snapshots)
     fare_version_ids = _reconcile_fare_versions(session, snapshots)
-    return _reconcile_route_versions(session, run_id, snapshots, route_ids, fare_version_ids)
+    return _reconcile_route_versions(
+        session,
+        run_id,
+        snapshots,
+        proposed_version_ids,
+        route_ids,
+        fare_version_ids,
+    )
 
 
 def _reconcile_routes(session: Session, snapshots: list[RouteSnapshot]) -> dict[str, PyUUID]:
@@ -595,6 +612,7 @@ def _reconcile_route_versions(
     session: Session,
     run_id: PyUUID,
     snapshots: list[RouteSnapshot],
+    proposed_version_ids: list[PyUUID],
     route_ids: dict[str, PyUUID],
     fare_version_ids: dict[FareVersionKey, PyUUID],
 ) -> list[tuple[RouteVersionRecord, bool]]:
@@ -606,9 +624,12 @@ def _reconcile_route_versions(
     )
     by_key = {_stored_route_version_key(version): version for version in stored_versions}
     proposed_by_key: dict[RouteVersionKey, tuple[PyUUID, RouteSnapshot, PyUUID | None]] = {}
-    for snapshot in snapshots:
+    for snapshot, proposed_version_id in zip(snapshots, proposed_version_ids, strict=True):
         key = _snapshot_route_version_key(snapshot, route_ids)
-        proposed_by_key.setdefault(key, (uuid4(), snapshot, _fare_version_id(snapshot, fare_version_ids)))
+        proposed_by_key.setdefault(
+            key,
+            (proposed_version_id, snapshot, _fare_version_id(snapshot, fare_version_ids)),
+        )
 
     new_keys = set(proposed_by_key) - set(by_key)
     if session.get_bind().dialect.name == "postgresql":
@@ -773,20 +794,14 @@ def _fare_policy_hash(fare_policy: FarePolicy) -> str:
     return sha256(payload.encode("utf-8")).hexdigest()
 
 
-class ChildRows(NamedTuple):
-    route_directions: list[dict]
-    route_segments: list[dict]
-    service_directions: list[dict]
-    schedule_entries: list[dict]
-    itinerary_steps: list[dict]
-
-
-def _persist_children(session: Session, new_versions: list[tuple[PyUUID, RouteSnapshot]]) -> None:
+def _persist_children(session: Session, new_versions: list[PreparedSnapshot]) -> None:
     child_rows = ChildRows([], [], [], [], [])
-    for route_version_id, snapshot in new_versions:
-        snapshot_rows = _materialize_child_rows(route_version_id, snapshot)
-        for table_rows, snapshot_table_rows in zip(child_rows, snapshot_rows, strict=True):
-            table_rows.extend(snapshot_table_rows)
+    for prepared in new_versions:
+        child_rows.route_directions.extend(prepared.child_rows.route_directions)
+        child_rows.route_segments.extend(prepared.child_rows.route_segments)
+        child_rows.service_directions.extend(prepared.child_rows.service_directions)
+        child_rows.schedule_entries.extend(prepared.child_rows.schedule_entries)
+        child_rows.itinerary_steps.extend(prepared.child_rows.itinerary_steps)
 
     _execute_bulk_insert(session, RouteDirectionRecord, child_rows.route_directions)
     _execute_bulk_insert(session, RouteSegmentRecord, child_rows.route_segments)

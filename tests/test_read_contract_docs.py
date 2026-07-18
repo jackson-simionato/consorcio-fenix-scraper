@@ -57,3 +57,27 @@ def test_postgres_persistence_verification_documents_the_isolated_database_gate_
     assert "_test" in verification
     assert "tests/test_postgres_persistence.py" in verification
     assert "No performance thresholds" in verification
+
+
+def test_operator_persistence_configuration_and_logging_are_documented():
+    readme = Path("README.md").read_text(encoding="utf-8")
+    verification = Path("docs/postgres-persistence-verification.md").read_text(encoding="utf-8")
+
+    for phrase in ["10,000", "sequential", "--db-batch-rows", "CONSORCIO_FENIX_DB_BATCH_ROWS"]:
+        assert phrase in readme
+
+    for phrase in [
+        "fetch_complete",
+        "persistence_batch_complete",
+        "persistence_batch_failed",
+        "persistence_complete",
+        "stderr",
+        "stdout",
+    ]:
+        assert phrase in verification
+
+
+def test_make_scrape_preserves_the_documented_limit_override():
+    makefile = Path("Makefile").read_text(encoding="utf-8")
+
+    assert 'scrape-routes --limit "$(LIMIT)"' in makefile
