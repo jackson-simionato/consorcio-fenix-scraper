@@ -70,6 +70,12 @@ DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/DATABASE
 
 Environment variables still take precedence over values from `.env`.
 
+## PostgreSQL Persistence Verification
+
+SQLite is the default unit-test path. Persistence and migration changes also have an opt-in check against a
+dedicated PostgreSQL/PostGIS test database; see
+[PostgreSQL Persistence Verification](docs/postgres-persistence-verification.md).
+
 ## Scope
 
 Consórcio Fênix pages are treated as canonical for route metadata, schedules, textual itineraries, and KML shapes. Stop coordinate enrichment is isolated behind a Floripa no Ponto adapter boundary and currently reports unavailable instead of failing route ingestion.

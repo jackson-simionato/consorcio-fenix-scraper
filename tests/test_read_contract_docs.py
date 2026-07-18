@@ -46,3 +46,14 @@ def test_onboard_advisory_readiness_is_documented():
 
     for phrase in required_phrases:
         assert phrase in contract
+
+
+def test_postgres_persistence_verification_documents_the_isolated_database_gate_and_command():
+    readme = Path("README.md").read_text(encoding="utf-8")
+    verification = Path("docs/postgres-persistence-verification.md").read_text(encoding="utf-8")
+
+    assert "PostgreSQL Persistence Verification" in readme
+    assert "POSTGRES_TEST_DATABASE_URL" in verification
+    assert "_test" in verification
+    assert "tests/test_postgres_persistence.py" in verification
+    assert "No performance thresholds" in verification
