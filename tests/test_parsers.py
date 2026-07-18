@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from consorcio_fenix_scraper.parsers.kml import extract_kml, parse_kml_directions
 from consorcio_fenix_scraper.parsers.route_page import parse_route_page
 
@@ -269,7 +271,52 @@ def test_kml_parser_extracts_linestrings_with_lon_lat_order():
     directions = parse_kml_directions(kml)
 
     assert [direction.name for direction in directions] == ["Ida", "Volta"]
+    assert [direction.direction_kind for direction in directions] == ["ida", "volta"]
     assert directions[0].coordinates == [(-48.5480, -27.5969), (-48.5440, -27.5900)]
+
+
+@pytest.mark.parametrize(
+    ("names", "expected_kinds"),
+    [
+        (("294 Ida T.SAN - T.FOR", "294 Volta T.FOR - T.SAN"), ("ida", "volta")),
+        (("VOLTA: Centro", "ida / Bairro"), ("volta", "ida")),
+    ],
+)
+def test_kml_parser_classifies_only_clean_ida_volta_pairs(names, expected_kinds):
+    kml = f'''<?xml version="1.0" encoding="UTF-8"?>
+    <kml xmlns="http://www.opengis.net/kml/2.2"><Document>
+      <Placemark><name>{names[0]}</name><LineString><coordinates>-48.1,-27.1,0 -48.2,-27.2,0</coordinates></LineString></Placemark>
+      <Placemark><name>{names[1]}</name><LineString><coordinates>-48.2,-27.2,0 -48.1,-27.1,0</coordinates></LineString></Placemark>
+    </Document></kml>'''
+
+    directions = parse_kml_directions(kml)
+
+    assert [direction.name for direction in directions] == list(names)
+    assert [direction.direction_kind for direction in directions] == list(expected_kinds)
+    assert directions[0].coordinates == [(-48.1, -27.1), (-48.2, -27.2)]
+    assert directions[1].coordinates == [(-48.2, -27.2), (-48.1, -27.1)]
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ("Volta ao Morro",),
+        ("Ida", "Circular"),
+        ("Circular", "Circular"),
+        ("181-ida-volta", "181 Volta"),
+        ("Ida", "Volta", "Reforço"),
+    ],
+)
+def test_kml_parser_leaves_non_clean_pairs_unclassified(names):
+    placemarks = "".join(
+        f"<Placemark><name>{name}</name><LineString><coordinates>-48.1,-27.1,0 -48.2,-27.2,0</coordinates></LineString></Placemark>"
+        for name in names
+    )
+    kml = f'<kml xmlns="http://www.opengis.net/kml/2.2"><Document>{placemarks}</Document></kml>'
+
+    directions = parse_kml_directions(kml)
+
+    assert [direction.direction_kind for direction in directions] == [None] * len(names)
 
 
 def test_kml_parser_accepts_raw_kml_file_contents():

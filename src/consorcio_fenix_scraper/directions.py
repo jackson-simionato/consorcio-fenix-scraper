@@ -12,7 +12,25 @@ from consorcio_fenix_scraper.domain import (
 )
 
 TERMINAL_TOKENS = ("ticen", "titri", "tican", "tirio", "tilag", "tisan", "terminal")
-_KIND_PATTERN = r"(^|[^a-z]){}([^a-z]|$)"
+_DIRECTION_KIND_PATTERN = re.compile(r"\b(ida|volta)\b", re.IGNORECASE)
+
+
+def classify_route_direction_pair(route_directions: list[RouteDirection]) -> None:
+    for direction in route_directions:
+        direction.direction_kind = None
+
+    if len(route_directions) != 2:
+        return
+
+    token_sets = [
+        {match.lower() for match in _DIRECTION_KIND_PATTERN.findall(direction.name)}
+        for direction in route_directions
+    ]
+    if token_sets.count({"ida"}) != 1 or token_sets.count({"volta"}) != 1:
+        return
+
+    for direction, tokens in zip(route_directions, token_sets, strict=True):
+        direction.direction_kind = "ida" if tokens == {"ida"} else "volta"
 
 
 def infer_service_direction_matches(
@@ -67,11 +85,12 @@ def infer_service_direction_matches(
 
 
 def _find_direction_sequence(route_directions: list[RouteDirection], kind: str) -> int | None:
-    pattern = re.compile(_KIND_PATTERN.format(re.escape(kind)), re.IGNORECASE)
-    for sequence, direction in enumerate(route_directions, start=1):
-        if pattern.search(_normalize(direction.name)):
-            return sequence
-    return None
+    matching_sequences = [
+        sequence
+        for sequence, direction in enumerate(route_directions, start=1)
+        if direction.direction_kind == kind
+    ]
+    return matching_sequences[0] if len(route_directions) == 2 and len(matching_sequences) == 1 else None
 
 
 def _looks_like_terminal_departure(label: str) -> bool:

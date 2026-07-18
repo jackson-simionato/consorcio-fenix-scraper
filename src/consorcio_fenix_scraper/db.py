@@ -158,6 +158,7 @@ class RouteDirectionRecord(Base):
     id: Mapped[PyUUID] = _uuid_pk()
     route_version_id: Mapped[PyUUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("route_versions.id"), index=True)
     name: Mapped[str] = mapped_column(Text)
+    direction_kind: Mapped[str | None] = mapped_column(Text)
     sequence: Mapped[int] = mapped_column(Integer)
     geometry: Mapped[object] = mapped_column(_geometry_type("LINESTRING"))
 
@@ -826,6 +827,7 @@ def _materialize_child_rows(route_version_id: PyUUID, snapshot: RouteSnapshot) -
                 "id": route_direction_id,
                 "route_version_id": route_version_id,
                 "name": direction.name,
+                "direction_kind": direction.direction_kind,
                 "sequence": index,
                 "geometry": _linestring_wkt(direction),
             }

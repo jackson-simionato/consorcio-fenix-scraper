@@ -85,7 +85,13 @@ def _normalized_database(session: Session) -> dict[str, list[tuple]]:
             )
         ),
         "directions": sorted(
-            (*version_identity_by_id[row.route_version_id], row.sequence, row.name, str(row.geometry))
+            (
+                *version_identity_by_id[row.route_version_id],
+                row.sequence,
+                row.name,
+                row.direction_kind,
+                str(row.geometry),
+            )
             for row in session.query(RouteDirectionRecord)
         ),
         "segments": sorted(

@@ -51,6 +51,7 @@ class RouteDirection(BaseModel):
     name: str
     coordinates: list[tuple[float, float]]
     geometry_type: Literal["LineString"] = "LineString"
+    direction_kind: Literal["ida", "volta"] | None = None
 
 
 class MaterializedRouteSegment(BaseModel):

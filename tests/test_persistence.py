@@ -1,3 +1,4 @@
+from copy import deepcopy
 from datetime import date
 from uuid import UUID
 
@@ -286,8 +287,8 @@ def _snapshot_with_directions(
         ItineraryStep(sequence=2, name="TITRI"),
     ]
     snapshot.directions = [
-        RouteDirection(name="Ida", coordinates=[(-48.548, -27.5969), (-48.547, -27.5969)]),
-        RouteDirection(name="Volta", coordinates=[(-48.547, -27.5969), (-48.548, -27.5969)]),
+        RouteDirection(name="Ida", direction_kind="ida", coordinates=[(-48.548, -27.5969), (-48.547, -27.5969)]),
+        RouteDirection(name="Volta", direction_kind="volta", coordinates=[(-48.547, -27.5969), (-48.548, -27.5969)]),
     ]
     snapshot.direction_matches = [
         ServiceDirectionMatch(
@@ -409,6 +410,40 @@ def test_persists_route_segments_for_new_route_versions(db_session: Session):
     assert all(segment.distance_meters > 0 for segment in route_segments)
     assert all(segment.cumulative_distance_meters == segment.distance_meters for segment in route_segments)
     assert all(0 <= segment.bearing_degrees < 360 for segment in route_segments)
+
+
+def test_persists_route_direction_kinds_for_new_route_versions(db_session: Session):
+    snapshot = _snapshot_with_directions()
+
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [snapshot])
+
+    directions = db_session.query(RouteDirectionRecord).order_by(RouteDirectionRecord.sequence).all()
+    assert [(direction.name, direction.direction_kind) for direction in directions] == [
+        ("Ida", "ida"),
+        ("Volta", "volta"),
+    ]
+
+
+def test_reused_route_version_does_not_backfill_route_direction_kinds(db_session: Session):
+    archived_snapshot = _snapshot_with_directions()
+    for direction in archived_snapshot.directions:
+        direction.direction_kind = None
+
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [archived_snapshot])
+    version = db_session.query(RouteVersionRecord).one()
+    archived_json = deepcopy(version.snapshot)
+    for direction in archived_json["directions"]:
+        direction.pop("direction_kind")
+    version.snapshot = archived_json
+    db_session.flush()
+
+    _persist_batch_for_test(db_session, "https://www.consorciofenix.com.br/horarios", [_snapshot_with_directions()])
+
+    directions = db_session.query(RouteDirectionRecord).order_by(RouteDirectionRecord.sequence).all()
+    assert len(directions) == 2
+    assert [direction.direction_kind for direction in directions] == [None, None]
+    assert all("direction_kind" not in direction for direction in version.snapshot["directions"])
 
 
 def test_reused_route_version_does_not_duplicate_route_segments(db_session: Session):

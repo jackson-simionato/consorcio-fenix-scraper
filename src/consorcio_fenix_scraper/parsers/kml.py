@@ -5,6 +5,7 @@ import re
 import xml.etree.ElementTree as ET
 
 from consorcio_fenix_scraper.domain import RouteDirection
+from consorcio_fenix_scraper.directions import classify_route_direction_pair
 
 KML_TEXT_RE = re.compile(r"kmltext\s*=\s*(['\"])(?P<value>.*?)(?<!\\)\1", re.DOTALL)
 KML_NS = {"kml": "http://www.opengis.net/kml/2.2"}
@@ -30,6 +31,7 @@ def parse_kml_directions(kml_text: str) -> list[RouteDirection]:
         coordinates = _coordinates_for_placemark(placemark)
         if coordinates:
             directions.append(RouteDirection(name=name, coordinates=coordinates))
+    classify_route_direction_pair(directions)
     return directions
 
 

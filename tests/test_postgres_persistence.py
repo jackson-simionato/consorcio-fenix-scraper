@@ -188,3 +188,47 @@ def test_postgres_cold_unchanged_and_changed_persistence_preserves_schema_and_no
     }
     for index_name, definition_fragment in expected_indexes.items():
         assert definition_fragment in indexes[index_name]
+
+
+def test_route_direction_kind_migration_preserves_existing_rows(
+    postgres_session_factory: sessionmaker[Session],
+    complete_snapshot_factory,
+):
+    assert POSTGRES_TEST_DATABASE_URL is not None
+    persist_snapshots(
+        postgres_session_factory,
+        "https://example.test/horarios",
+        [complete_snapshot_factory()],
+    )
+    with postgres_session_factory() as session:
+        existing = session.execute(
+            text("SELECT id, name FROM route_directions")
+        ).one()
+
+    alembic_config = Config("alembic.ini")
+    alembic_config.set_main_option("sqlalchemy.url", POSTGRES_TEST_DATABASE_URL)
+    command.downgrade(alembic_config, "20260504_0003")
+    try:
+        with postgres_session_factory() as session:
+            after_downgrade = session.execute(
+                text("SELECT id, name FROM route_directions")
+            ).one()
+            column_count = session.scalar(
+                text(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'route_directions' "
+                    "AND column_name = 'direction_kind'"
+                )
+            )
+        assert after_downgrade == existing
+        assert column_count == 0
+    finally:
+        command.upgrade(alembic_config, "head")
+
+    with postgres_session_factory() as session:
+        after_upgrade = session.execute(
+            text("SELECT id, name, direction_kind FROM route_directions")
+        ).one()
+    assert after_upgrade[:2] == existing
+    assert after_upgrade.direction_kind is None
