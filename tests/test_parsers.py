@@ -297,6 +297,19 @@ def test_kml_parser_classifies_only_clean_ida_volta_pairs(names, expected_kinds)
     assert directions[1].coordinates == [(-48.2, -27.2), (-48.1, -27.1)]
 
 
+def test_kml_parser_preserves_route_code_prefixed_names_while_classifying_pair():
+    kml = """<?xml version="1.0" encoding="UTF-8"?>
+    <kml xmlns="http://www.opengis.net/kml/2.2"><Document>
+      <Placemark><name>165-Ida</name><LineString><coordinates>-48.1,-27.1,0 -48.2,-27.2,0</coordinates></LineString></Placemark>
+      <Placemark><name>165-Volta</name><LineString><coordinates>-48.2,-27.2,0 -48.1,-27.1,0</coordinates></LineString></Placemark>
+    </Document></kml>"""
+
+    directions = parse_kml_directions(kml)
+
+    assert [direction.name for direction in directions] == ["165-Ida", "165-Volta"]
+    assert [direction.direction_kind for direction in directions] == ["ida", "volta"]
+
+
 @pytest.mark.parametrize(
     "names",
     [
